@@ -96,7 +96,7 @@ try:
     
     if api_key:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-pro-latest') 
+        model = genai.GenerativeModel('gemini-2.5-pro') 
         ai_enabled = True
     else:
         st.warning("Google API Key not found. The AI Summary feature is disabled.")
