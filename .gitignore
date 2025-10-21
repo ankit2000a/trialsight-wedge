@@ -1,0 +1,4 @@
+.venv/
+.streamlit/
+*.db
+.DS_Store
