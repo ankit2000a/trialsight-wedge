@@ -96,7 +96,6 @@ try:
     
     if api_key:
         genai.configure(api_key=api_key)
-        # *** CORRECTED MODEL NAME ***
         model = genai.GenerativeModel('gemini-1.5-pro-latest') 
         ai_enabled = True
     else:
@@ -229,6 +228,18 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 
 # --- Display Results Section ---
 if st.session_state.get('diff_html'):
+    
+    # --- NEW DEBUGGER ---
+    with st.expander("Show/Hide Extracted Text (For Debugging)"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Text from Original")
+            st.text_area("Original Text", st.session_state.original_text, height=200, key="debug_text1")
+        with col2:
+            st.subheader("Text from Revised")
+            st.text_area("Revised Text", st.session_state.revised_text, height=200, key="debug_text2")
+    # --- END NEW DEBUGGER ---
+
     with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
         st.components.v1.html(st.session_state.diff_html, height=600, scrolling=True)
 
