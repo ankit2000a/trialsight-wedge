@@ -107,16 +107,19 @@ except Exception as e:
 
 
 # --- Helper Functions ---
+
+# ***FIX 1:***
+# We cache the function that takes BYTES, not the file object.
+# This makes the cache reliable.
 @st.cache_data
-def read_pdf_text(_uploaded_file):
-    """Extracts text from an uploaded PDF file."""
+def extract_text_from_bytes(file_bytes, filename="file"):
+    """Extracts text from PDF bytes."""
     try:
-        file_bytes = _uploaded_file.getvalue()
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = " ".join(page.get_text() for page in doc)
         return text
     except Exception as e:
-        return f"Error reading {_uploaded_file.name}: {e}"
+        return f"Error reading {filename}: {e}"
 
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     """Creates a side-by-side HTML diff of two texts."""
@@ -215,8 +218,14 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             
-            text1 = read_pdf_text(file1)
-            text2 = read_pdf_text(file2)
+            # ***FIX 2:***
+            # We read the bytes from the files first.
+            file1_bytes = file1.getvalue()
+            file2_bytes = file2.getvalue()
+            
+            # Then we pass the BYTES to our cached function.
+            text1 = extract_text_from_bytes(file1_bytes, file1.name)
+            text2 = extract_text_from_bytes(file2_bytes, file2.name)
             
             if text1 is not None and text2 is not None:
                 st.session_state['original_text'] = text1
@@ -229,7 +238,7 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 # --- Display Results Section ---
 if st.session_state.get('diff_html'):
     
-    # --- NEW DEBUGGER ---
+    # --- DEBUGGER (Still useful!) ---
     with st.expander("Show/Hide Extracted Text (For Debugging)"):
         col1, col2 = st.columns(2)
         with col1:
@@ -238,7 +247,7 @@ if st.session_state.get('diff_html'):
         with col2:
             st.subheader("Text from Revised")
             st.text_area("Revised Text", st.session_state.revised_text, height=200, key="debug_text2")
-    # --- END NEW DEBUGGER ---
+    # --- END DEBUGGER ---
 
     with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
         st.components.v1.html(st.session_state.diff_html, height=600, scrolling=True)
