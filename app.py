@@ -193,10 +193,11 @@ def get_ai_summary(text1, text2):
 
     # Filter for actual change lines (+ or -), ignoring file headers
     # Also ignore lines that are purely whitespace changes after the +/-
+    # --- This is the variable we should use ---
     diff_text_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++')) and line[1:].strip()]
 
     # Check if *any* non-whitespace difference was found
-    changes_found = bool(diff_text_lines)
+    changes_found = bool(diff_text_lines) # Use the correct variable
 
     if not changes_found:
          # Check if the original diff had *any* lines (even ignored whitespace ones)
@@ -208,7 +209,8 @@ def get_ai_summary(text1, text2):
 
 
     # Join the *meaningful* lines for the prompt
-    diff_text = "".join(meaningful_diff_lines)
+    # --- FIX THE TYPO HERE ---
+    diff_text = "".join(diff_text_lines) # Use the correct variable name
 
     # --- REFINED PROMPT ---
     prompt = f"""
