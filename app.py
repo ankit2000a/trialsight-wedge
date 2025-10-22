@@ -1,36 +1,32 @@
 import streamlit as st
 import fitz  # PyMuPDF
-# import difflib # Using DMP now
 import os
 import time
 import re
 import sys
 import unicodedata # For robust normalization
+
 # --- ENSURE THESE ARE IMPORTED ---
+ai_import_success = False
+dmp_import_success = False
+genai_types = None # To hold genai.types or google.generativeai.types
+
 try:
     import google.generativeai as genai
+    # Import specific types needed for API v0.5+
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    genai_types = genai.types # Store for later use
+    ai_import_success = True
 except ImportError:
     st.error("ERROR: google.generativeai library not found. Please install it: pip install google-generativeai")
-    # Set dummy genai object to avoid further NameErrors downstream if import fails
-    class DummyGenAI: pass
-    genai = DummyGenAI()
-    genai.GenerativeModel = lambda x: None # Mock the model function
-    api_key = None # Ensure api_key is None if import fails
-    ai_enabled = False
+    ai_import_success = False
 
 try:
     import diff_match_patch as dmp_module
+    dmp_import_success = True
 except ImportError:
     st.error("ERROR: diff-match-patch library not found. Please install it: pip install diff-match-patch")
-    # Set dummy dmp object
-    class DummyDMP:
-        def diff_main(self, t1, t2): return []
-        def diff_cleanupSemantic(self, d): pass
-        def diff_prettyHtml(self, d): return "Error: diff-match-patch not installed."
-        DIFF_INSERT = 1
-        DIFF_DELETE = -1
-        DIFF_EQUAL = 0
-    dmp_module = DummyDMP()
+    dmp_import_success = False
 
 
 # --- Page Configuration ---
@@ -54,7 +50,18 @@ st.markdown("""
     .stFileUploader [data-testid="stFileUploadDropzone"]:has(+ div [data-testid="stFileUploaderFile"]) p { display: none; }
 
 
-    .file-card { background-color: #2D3748; border-radius: 0.5rem; padding: 0.8rem 1rem; border: 1px solid #4A5568; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;}
+    /* --- UI FIX: Changed file-card background to green per screenshot --- */
+    .file-card {
+        background-color: #22543D; /* Dark Green */
+        color: #C6F6D5; /* Light Green Text */
+        border-radius: 0.5rem;
+        padding: 0.8rem 1rem;
+        border: 1px solid #276749; /* Darker Green Border */
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1rem;
+    }
     /* Diff (using DMP prettyHTML styles) */
     .diff-container { font-family: Consolas, 'Courier New', monospace; font-size: 0.9em; line-height: 1.4; border: 1px solid #4A5568; border-radius: 0.5rem; padding: 1rem; background-color: #1A202C; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }
     ins { background-color: rgba(16, 185, 129, 0.2); color: #A7F3D0; text-decoration: none; }
@@ -87,11 +94,11 @@ def init_session_state():
 init_session_state()
 
 # --- Gemini API Configuration ---
-# Moved after imports, includes fallback logic
+# --- CODE FIX: Cleaned up logic to check import flag ---
 ai_enabled = False
 api_key = None
-# Check if genai was imported successfully before trying to use it
-if 'google.generativeai' in sys.modules:
+# Check if genai was imported successfully
+if ai_import_success:
     try:
         api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets else None
         api_key_env = os.environ.get("GOOGLE_API_KEY")
@@ -99,7 +106,8 @@ if 'google.generativeai' in sys.modules:
         if api_key:
             genai.configure(api_key=api_key)
             if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
-                 try: st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+                 try:
+                     st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
                  except Exception:
                       st.warning("Failed to initialize gemini-2.5-pro, falling back to gemini-pro.")
                       st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Fallback
@@ -111,7 +119,8 @@ if 'google.generativeai' in sys.modules:
     except Exception as e:
         ai_enabled = False; st.warning(f"Could not initialize Google AI: {e}")
         if 'gemini_model' in st.session_state: st.session_state.gemini_model = None # Reset model state on error
-# else: ai_enabled is already False from import failure
+else:
+    ai_enabled = False # Already false from import failure, but explicit
 
 
 # --- Helper Functions ---
@@ -195,9 +204,9 @@ def generate_dmp_diff_html(text1_norm, text2_norm):
        text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
          return "<p style='color:red;'>Error: Cannot generate visual diff (text normalization failed).</p>"
     try:
-        # Check if dmp_module was imported correctly
-        if not hasattr(dmp_module, 'diff_match_patch'):
-             return "<p style='color:red;'>Error: diff-match-patch library not loaded correctly.</p>"
+        # --- CODE FIX: Check dmp_import_success flag ---
+        if not dmp_import_success:
+             return "<p style='color:red;'>Error: diff-match-patch library not loaded correctly (import failed).</p>"
 
         dmp = dmp_module.diff_match_patch()
         dmp.Diff_Timeout = 2.0
@@ -228,9 +237,9 @@ def get_ai_summary(text1_norm, text2_norm):
     text1_lower = text1_norm.lower()
     text2_lower = text2_norm.lower()
 
-    # Check if dmp_module was imported correctly
-    if not hasattr(dmp_module, 'diff_match_patch'):
-         return "ERROR: diff-match-patch library not loaded correctly."
+    # --- CODE FIX: Check dmp_import_success flag ---
+    if not dmp_import_success:
+         return "ERROR: diff-match-patch library not loaded correctly (import failed)."
 
     dmp = dmp_module.diff_match_patch()
     dmp.Diff_Timeout = 1.0
@@ -270,7 +279,7 @@ def get_ai_summary(text1_norm, text2_norm):
 
     diff_text_for_prompt = "".join(meaningful_diff_fragments_for_ai)
 
-    # --- AI Prompt (v23 - Using correctly normalized DMP diff fragments, focus on content) ---
+    # --- UI FIX & AI Prompt: Match screenshot headers ---
     prompt = f"""
     Analyze the provided ADDED (+) and DELETED (-) content fragments from a comparison of two normalized clinical trial protocols (lowercase, rejoined words, normalized whitespace). Categorize these fragments based on potential clinical significance, ignoring minor variations.
 
@@ -281,13 +290,13 @@ def get_ai_summary(text1_norm, text2_norm):
     4.  **IGNORE Noise:** Explicitly IGNORE fragments that are likely just minor rephrasing, single common word substitutions (a/the), isolated numbers/symbols, or artifacts of normalization if they don't change the core meaning.
     5.  **Output Format:** Structure your response EXACTLY like this:
 
-        #### Clinically Significant Changes (Added/Deleted Content)
+        #### Clinically Significant Changes (Added/Deleted Lines)
         * [List ONLY significant ADDED (+) or DELETED (-) content here, with brief justification. If none found, state "None found."]
 
-        #### Other Substantive Added Content
+        #### Other Added Lines
         * [List ALL OTHER clearly ADDED (+) content fragments here. If none found, state "None found."]
 
-        #### Other Substantive Deleted Content
+        #### Other Deleted Lines
         * [List ALL OTHER clearly DELETED (-) content fragments here. If none found, state "None found."]
 
     **Meaningful Added (+) and Deleted (-) Content Fragments (Robustly Normalized):**
@@ -300,15 +309,23 @@ def get_ai_summary(text1_norm, text2_norm):
 
 
     try:
-        # Safety settings and generation config remain the same
-        safety_settings = [ {"category": c.name, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in genai.types.HarmCategory] # Use enum names
-        generation_config = genai.types.GenerationConfig(temperature=0.1)
+        # --- CODE FIX: Use updated safety settings and GenerationConfig class ---
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+        }
+        # Use genai.GenerationConfig, not genai.types.GenerationConfig
+        generation_config = genai.GenerationConfig(temperature=0.1)
+
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
              return "ERROR: Gemini model not initialized."
+
         model = st.session_state.gemini_model
         response = model.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
 
-        # Robust response handling (unchanged)
+        # Robust response handling (unchanged, .name attributes work correctly)
         if not response.candidates:
             block_reason = "Unknown";
             if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'): block_reason = response.prompt_feedback.block_reason.name # Use enum name
@@ -383,7 +400,8 @@ with clear_col:
      if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
         # Add some top margin to align better with file cards
         st.markdown('<div style="margin-top: 0.5rem;"></div>', unsafe_allow_html=True) # Adjusted margin
-        if st.button("Clear", key="clear_btn", use_container_width=True):
+        # --- UI FIX: Changed button text ---
+        if st.button("Clear Files and Start Over", key="clear_btn", use_container_width=True):
             keys_to_clear = ['file1_data', 'file2_data', 'diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
             for key in keys_to_clear:
                 if key in st.session_state: del st.session_state[key]
@@ -447,8 +465,8 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
         # Display the HTML error or a default message if None
         st.markdown(diff_output if diff_output else "<p style='color:red;'>Unknown error generating comparison.</p>", unsafe_allow_html=True)
     else:
-        # --- DEBUGGER (Shows the robustly normalized text) ---
-        with st.expander("Show/Hide Normalized Text (Used for Comparison)"):
+        # --- UI FIX: Changed expander text ---
+        with st.expander("Show/Hide Extracted Text (Cleaned for Diff)"):
             col1, col2 = st.columns(2)
             original_display = st.session_state.get('original_text_normalized', "Not available")
             revised_display = st.session_state.get('revised_text_normalized', "Not available")
@@ -457,10 +475,11 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
             with col2: st.subheader("Revised (Normalized)"); st.text_area("Revised Norm", revised_display, height=200, key="dbg_txt2_norm")
 
 
-        # --- Visual Diff using diff-match-patch output ---
-        st.subheader("Visual Comparison of Content Changes")
-        st.markdown("*(Green = Added, Red = Deleted. Formatting differences ignored due to normalization)*")
-        st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True) # Display DMP HTML
+        # --- UI FIX: Added expander for visual diff ---
+        with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
+            st.subheader("Visual Comparison of Content Changes")
+            st.markdown("*(Green = Added, Red = Deleted. Formatting differences ignored due to normalization)*")
+            st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True) # Display DMP HTML
 
         st.markdown("---")
 
@@ -502,16 +521,18 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                 try:
                     sections = {}
                     current_section_key = None
-                    headers_map = { # Ensure these match the AI prompt's H4 headers
-                        "#### Clinically Significant Changes (Added/Deleted Content)": "significant",
-                        "#### Other Substantive Added Content": "added", # Match prompt
-                        "#### Other Substantive Deleted Content": "deleted" # Match prompt
+                    # --- UI FIX: Updated headers map to match prompt/screenshot ---
+                    headers_map = {
+                        "#### Clinically Significant Changes (Added/Deleted Lines)": "significant",
+                        "#### Other Added Lines": "added",
+                        "#### Other Deleted Lines": "deleted"
                     }
                     header_display = {
-                         "significant": "Clinically Significant Changes (Added/Deleted Content)",
-                         "added": "Other Substantive Added Content",
-                         "deleted": "Other Substantive Deleted Content"
+                         "significant": "Clinically Significant Changes (Added/Deleted Lines)",
+                         "added": "Other Added Lines",
+                         "deleted": "Other Deleted Lines"
                     }
+
                     for line in summary_text.splitlines():
                         line_strip = line.strip()
                         matched_header = False
@@ -529,7 +550,8 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                         elif current_section_key and line_strip and "none found" in line_strip.lower(): # Capture 'None found' case
                              sections[current_section_key].append(line_strip)
 
-                    st.markdown("### Categorized Summary of Content Changes:") # Display title
+                    # --- UI FIX: Updated summary title per screenshot ---
+                    st.markdown("### Categorized Summary (Word Filtered):") # Display title
                     # Display each section
                     for key, display_name in header_display.items():
                         st.markdown(f'<p class="summary-header">{display_name}</p>', unsafe_allow_html=True)
@@ -576,4 +598,3 @@ elif not st.session_state.get('processing_comparison') and st.session_state.get(
 elif st.session_state.get('processing_comparison'):
      # Show spinner if the processing flag is set
      st.markdown('<div class="loader-container"><div class="loader"></div><p>Processing...</p></div>', unsafe_allow_html=True)
-
