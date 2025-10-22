@@ -47,9 +47,17 @@ st.markdown("""
 
 # --- Session State Initialization ---
 def init_session_state():
-    for key in ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text', 'revised_text']:
-        if key not in st.session_state: st.session_state[key] = None
-    if 'processing_comparison' not in st.session_state: st.session_state.processing_comparison = False
+    # Add keys for different text versions
+    keys = ['file1_data', 'file2_data', 'diff_html', 'summary',
+            'original_text_display', 'revised_text_display', # For visual diff
+            'original_text_ai', 'revised_text_ai', # For AI comparison
+            'processing_comparison']
+    for key in keys:
+        if key not in st.session_state:
+            st.session_state[key] = None
+    if st.session_state.processing_comparison is None:
+         st.session_state.processing_comparison = False
+
 init_session_state()
 
 # --- Gemini API Configuration ---
@@ -64,7 +72,14 @@ try:
     if api_key:
         genai.configure(api_key=api_key)
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
-             st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+             # Check model availability - maybe fall back if 2.5-pro fails?
+             try:
+                 st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+                 # Try a quick test call? Could hit quota.
+             except Exception as model_err:
+                 print(f"Warning: Failed to initialize gemini-2.5-pro: {model_err}. Falling back.")
+                 # Fallback model if needed (adjust based on availability)
+                 st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Example fallback
         model = st.session_state.gemini_model
         ai_enabled = True
     else:
@@ -77,10 +92,10 @@ except Exception as e:
 
 # --- Helper Functions ---
 
+# --- Function 1: Minimal cleaning for VISUAL DIFF ---
 @st.cache_data
-def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts text with minimal cleaning, preserving line structure for visual diff."""
-    # Using the simpler cleaning good for visual diff
+def extract_text_for_display(file_bytes, filename="file"):
+    """Extracts text with minimal cleaning, preserving structure for visual diff."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = "\n".join(page.get_text("text", sort=True) for page in doc)
@@ -92,24 +107,50 @@ def extract_text_from_bytes(file_bytes, filename="file"):
         text = "\n".join(cleaned_lines)
         text = re.sub(r'\n(\s*\n)+', '\n\n', text)
         text = text.strip()
+        if not text: return f"ERROR: No text found in PDF {filename}"
+        return text
+    except Exception as e:
+        print(f"Error (display text) reading {filename}: {e}")
+        return f"ERROR: Could not read {filename}. Details: {e}"
+
+# --- Function 2: Hyper-aggressive cleaning for AI COMPARISON ---
+@st.cache_data
+def extract_text_for_ai(file_bytes, filename="file"):
+    """Extracts text and performs HYPER-AGGRESSIVE cleaning for AI comparison."""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        text = " ".join(page.get_text("text", sort=True) for page in doc) # Join pages with space initially
+
+        # --- Hyper-Aggressive Cleaning ---
+        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
+        text = text.lower() # Lowercase
+        # Remove punctuation carefully - keep hyphens? Maybe remove all non-alphanumeric/space
+        # A simpler approach: replace common punctuation with space first
+        text = re.sub(r'[.,;:"“”‘’()\[\]/?!]', ' ', text)
+        # Collapse ALL whitespace (newlines, tabs, multiple spaces) to single spaces
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+
         if not text:
-             print(f"Warning: No text extracted from {filename}")
+             # Reuse error message from display function if needed
+             print(f"Warning: No text extracted (for AI) from {filename}")
              return f"ERROR: No text found in PDF {filename}"
         return text
     except Exception as e:
-        print(f"Error reading {filename}: {e}")
+        print(f"Error (AI text) reading {filename}: {e}")
+        # Reuse error message
         return f"ERROR: Could not read {filename}. Details: {e}"
 
 
-def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
-    """Creates side-by-side HTML diff using difflib (for visual presentation)."""
-    # Still use difflib for the standard visual HTML table
-    if text1 is None or text2 is None or text1.startswith("ERROR:") or text2.startswith("ERROR:"):
-         return "Error: Cannot generate diff (text extraction failed)."
+def generate_diff_html(text1_display, text2_display, filename1="Original", filename2="Revised"):
+    """Creates side-by-side HTML diff using the DISPLAY text version."""
+    if text1_display is None or text2_display is None or text1_display.startswith("ERROR:") or text2_display.startswith("ERROR:"):
+         return "Error: Cannot generate visual diff (text extraction failed)."
     try:
+        # Use display text (with line breaks)
         html = difflib.HtmlDiff(wrapcolumn=80, tabsize=4).make_table(
-            text1.splitlines(),
-            text2.splitlines(),
+            text1_display.splitlines(),
+            text2_display.splitlines(),
             fromdesc=filename1,
             todesc=filename2
         )
@@ -129,61 +170,52 @@ def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     except Exception as e:
         print(f"Error generating HTML diff: {e}")
         if isinstance(e, RecursionError):
-            return "Error: Failed to generate visual comparison due to text complexity. Try smaller sections."
+            return "Error: Failed to generate visual comparison due to text complexity."
         return f"Error: Failed to generate visual comparison. {e}"
 
 
-def get_ai_summary(text1, text2):
-    """Generates a categorized summary using AI after diff_match_patch comparison."""
+def get_ai_summary(text1_ai, text2_ai):
+    """Generates a categorized summary using AI based on hyper-cleaned diff_match_patch comparison."""
     # --- Input Validation ---
     if not ai_enabled: return "AI Summary feature is not available (API key issue)."
-    if text1 is None or text2 is None or (isinstance(text1, str) and text1.startswith("ERROR:")) or (isinstance(text2, str) and text2.startswith("ERROR:")):
-        return "AI Summary cannot be generated: text extraction failed."
+    # Check the AI-specific text versions
+    if text1_ai is None or text2_ai is None or \
+       (isinstance(text1_ai, str) and text1_ai.startswith("ERROR:")) or \
+       (isinstance(text2_ai, str) and text2_ai.startswith("ERROR:")):
+        return "AI Summary cannot be generated: hyper-cleaned text extraction failed."
 
-    # --- Use diff_match_patch for AI input ---
+    # --- Use diff_match_patch on HYPER-CLEANED text ---
     dmp = dmp_module.diff_match_patch()
-    # Use the minimally cleaned text (preserving paragraphs) for DMP
-    diffs = dmp.diff_main(text1, text2)
-    dmp.diff_cleanupSemantic(diffs) # Clean up diffs for better readability
+    diffs = dmp.diff_main(text1_ai, text2_ai) # These are single strings now
+    dmp.diff_cleanupSemantic(diffs)
 
     # --- Extract ONLY true additions and deletions for the AI ---
-    # Convert DMP diffs format (operation, text) to +/- lines
-    meaningful_diff_lines_for_ai = []
+    meaningful_diff_fragments_for_ai = []
     for op, data in diffs:
-        # op is -1 (Delete), 1 (Insert), 0 (Equal)
-        data_strip = data.strip()
-        if not data_strip: continue # Skip whitespace-only changes
+        data_strip = data.strip() # Strip again just in case
+        if not data_strip: continue # Skip empty/whitespace fragments
 
         prefix = ""
-        if op == dmp.DIFF_INSERT:
-            prefix = "+"
-        elif op == dmp.DIFF_DELETE:
-            prefix = "-"
-        else: # op == dmp.DIFF_EQUAL
-            continue # Skip equal parts
+        if op == dmp.DIFF_INSERT: prefix = "+"
+        elif op == dmp.DIFF_DELETE: prefix = "-"
+        else: continue # Skip equal parts
 
-        # Add prefix line by line if data contains newlines
-        lines = data_strip.splitlines()
-        for line in lines:
-            line_content = line.strip()
-            if line_content: # Ensure line is not blank after splitting/stripping
-                meaningful_diff_lines_for_ai.append(f"{prefix}{line_content}\n")
+        meaningful_diff_fragments_for_ai.append(f"{prefix}{data_strip}\n") # Add newline for prompt clarity
 
 
     # --- Handle No Differences Case ---
-    if not meaningful_diff_lines_for_ai:
-        # Check if the original texts were actually different after basic cleaning
-        if text1 != text2:
-            return "INFO: No significant content changes detected by diff_match_patch. Differences may be minor whitespace or formatting variations missed by initial cleaning."
-        else:
-            return "INFO: No textual differences were found between the documents."
+    if not meaningful_diff_fragments_for_ai:
+        # Check if original texts were actually different before hyper-cleaning
+        # Need to re-read or use display text for a meaningful check here
+        # Let's assume if DMP found nothing on hyper-clean, there's no content change
+         return "INFO: No substantive content changes detected after aggressive cleaning (ignoring formatting, case, punctuation, and whitespace)."
 
-    diff_text_for_prompt = "".join(meaningful_diff_lines_for_ai)
 
-    # --- AI Prompt (v13 - Using clean DMP diff) ---
-    # Keep the same prompt structure, just updating context description
+    diff_text_for_prompt = "".join(meaningful_diff_fragments_for_ai)
+
+    # --- AI Prompt (v14 - Using hyper-clean DMP diff fragments) ---
     prompt = f"""
-    Analyze the provided ADDED (+) and DELETED (-) content fragments, which represent meaningful content changes between two clinical trial protocol versions identified by the diff-match-patch algorithm (reformatting noise should be minimal). Categorize these changes.
+    Analyze the provided ADDED (+) and DELETED (-) content fragments. These fragments represent meaningful content changes between two clinical trial protocol versions after aggressive cleaning (lowercase, punctuation/whitespace removed). Categorize these fragments.
 
     **Instructions:**
     1.  **Clinically Significant Changes:** Identify ADDED (+) or DELETED (-) fragments clearly related to:
@@ -192,9 +224,9 @@ def get_ai_summary(text1, text2):
         * Procedures / Assessments
         * Safety reporting
         * Objectives / Endpoints
-        List these first, inferring context if possible.
-    2.  **Other Added Content:** List ALL OTHER provided ADDED (+) fragments not in the significant category.
-    3.  **Other Deleted Content:** List ALL OTHER provided DELETED (-) fragments not in the significant category.
+        List these first. Due to cleaning, precise location is lost, but indicate the nature of the change.
+    2.  **Other Added Content:** List ALL OTHER provided ADDED (+) fragments.
+    3.  **Other Deleted Content:** List ALL OTHER provided DELETED (-) fragments.
     4.  **Output Format:** Structure your response EXACTLY like this, using markdown H4 (####) for headers:
 
         #### Clinically Significant Changes (Added/Deleted Content)
@@ -206,7 +238,7 @@ def get_ai_summary(text1, text2):
         #### Other Deleted Content
         * [List ALL OTHER non-blank DELETED (-) content from the input here. If none found, state "None found."]
 
-    **Meaningful Added (+) and Deleted (-) Content Fragments (from diff_match_patch):**
+    **Meaningful Added (+) and Deleted (-) Content Fragments (Hyper-Cleaned):**
     ---
     {diff_text_for_prompt[:8000]}
     ---
@@ -215,6 +247,7 @@ def get_ai_summary(text1, text2):
     """
 
     try:
+        # Safety settings and generation config remain the same
         safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         generation_config = genai.types.GenerationConfig(temperature=0.1)
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
@@ -233,7 +266,11 @@ def get_ai_summary(text1, text2):
              response_text = candidate.content.parts[0].text.strip()
              return response_text
         else:
-             return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}"
+             # Add safety ratings if available and finish reason suggests safety block
+             safety_ratings_str = "N/A"
+             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'):
+                  safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
+             return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}. Safety Ratings: [{safety_ratings_str}]"
     except Exception as e:
         error_message = f"ERROR: Failed to get AI summary: {e}"
         if "quota" in str(e).lower() or "429" in str(e): error_message += "\n(Quota exceeded?)"
@@ -242,7 +279,7 @@ def get_ai_summary(text1, text2):
 
 # --- Main App UI ---
 st.title("📄 TrialSight: Document Comparator")
-st.markdown("Compare two versions of a document and get an AI-powered summary of meaningful changes.")
+st.markdown("Compare two versions of a document and get an AI-powered summary of content changes.")
 st.markdown("---")
 
 # File Uploader & Display Logic
@@ -253,7 +290,8 @@ if not st.session_state.get('file1_data') and not st.session_state.get('file2_da
         else:
             st.session_state.file1_data = uploaded_files[0]
             st.session_state.file2_data = uploaded_files[1]
-            keys_to_clear = ['diff_html', 'summary', 'original_text', 'revised_text']
+            # Clear all results on new upload
+            keys_to_clear = ['diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai']
             for key in keys_to_clear:
                 if key in st.session_state: del st.session_state[key]
             st.session_state.processing_comparison = False
@@ -265,7 +303,7 @@ else:
     with col1: st.success(f"Original: **{file1_name}**")
     with col2: st.success(f"Revised: **{file2_name}**")
     if st.button("Clear Files and Start Over"):
-        keys_to_clear = ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text', 'revised_text', 'processing_comparison']
+        keys_to_clear = ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai', 'processing_comparison']
         for key in keys_to_clear:
             if key in st.session_state: del st.session_state[key]
         st.rerun()
@@ -276,7 +314,8 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
     if not st.session_state.get('diff_html') and not st.session_state.get('processing_comparison'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
             st.session_state.processing_comparison = True
-            keys_to_clear = ['diff_html', 'summary', 'original_text', 'revised_text']
+            # Clear previous results
+            keys_to_clear = ['diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai']
             for key in keys_to_clear:
                  if key in st.session_state: del st.session_state[key]
             st.rerun()
@@ -288,12 +327,23 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             if file1 and file2:
-                # Use the extraction function suitable for HTML diff
-                text1 = extract_text_from_bytes(file1.getvalue(), file1.name)
-                text2 = extract_text_from_bytes(file2.getvalue(), file2.name)
-                st.session_state['original_text'] = text1 # Store this version for display/AI
-                st.session_state['revised_text'] = text2 # Store this version for display/AI
-                st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name) # Use this version for HTML
+                file1_bytes = file1.getvalue()
+                file2_bytes = file2.getvalue()
+
+                # --- Extract BOTH versions ---
+                text1_display = extract_text_for_display(file1_bytes, file1.name)
+                text2_display = extract_text_for_display(file2_bytes, file2.name)
+                text1_ai = extract_text_for_ai(file1_bytes, file1.name)
+                text2_ai = extract_text_for_ai(file2_bytes, file2.name)
+
+                # Store both versions
+                st.session_state['original_text_display'] = text1_display
+                st.session_state['revised_text_display'] = text2_display
+                st.session_state['original_text_ai'] = text1_ai
+                st.session_state['revised_text_ai'] = text2_ai
+
+                # Generate HTML diff using display version
+                st.session_state['diff_html'] = generate_diff_html(text1_display, text2_display, file1.name, file2.name) # Handles internal errors
             else:
                 st.session_state['diff_html'] = "Error: File data missing."
                 st.session_state['summary'] = None
@@ -306,37 +356,52 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 # --- Display Results Section ---
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and isinstance(st.session_state.get('diff_html'), str) and not st.session_state.get('diff_html', "").startswith("Error:"):
 
-    # --- DEBUGGER (Shows minimally cleaned text) ---
-    with st.expander("Show/Hide Cleaned Text (Used for Visual Diff & AI Input)"):
+    # --- DEBUGGER (Shows BOTH cleaned versions) ---
+    with st.expander("Show/Hide Cleaned Text Versions"):
         col1, col2 = st.columns(2)
-        original_display = st.session_state.get('original_text') if isinstance(st.session_state.get('original_text'), str) else "Extraction Error or Not Run"
-        revised_display = st.session_state.get('revised_text') if isinstance(st.session_state.get('revised_text'), str) else "Extraction Error or Not Run"
-        with col1: st.subheader("Original (Cleaned)"); st.text_area("Original", original_display, height=200, key="dbg_txt1")
-        with col2: st.subheader("Revised (Cleaned)"); st.text_area("Revised", revised_display, height=200, key="dbg_txt2")
+        # Display text, handle None or Error strings gracefully
+        original_display_txt = st.session_state.get('original_text_display') if isinstance(st.session_state.get('original_text_display'), str) else "Extraction Error or Not Run"
+        revised_display_txt = st.session_state.get('revised_text_display') if isinstance(st.session_state.get('revised_text_display'), str) else "Extraction Error or Not Run"
+        original_ai_txt = st.session_state.get('original_text_ai') if isinstance(st.session_state.get('original_text_ai'), str) else "Extraction Error or Not Run"
+        revised_ai_txt = st.session_state.get('revised_text_ai') if isinstance(st.session_state.get('revised_text_ai'), str) else "Extraction Error or Not Run"
 
-    # --- Side-by-Side Diff ---
+        with col1:
+            st.subheader("Original (For Visual Diff)")
+            st.text_area("Original Display", original_display_txt, height=150, key="dbg_txt1_disp")
+            st.subheader("Original (For AI Compare)")
+            st.text_area("Original AI", original_ai_txt, height=150, key="dbg_txt1_ai")
+        with col2:
+            st.subheader("Revised (For Visual Diff)")
+            st.text_area("Revised Display", revised_display_txt, height=150, key="dbg_txt2_disp")
+            st.subheader("Revised (For AI Compare)")
+            st.text_area("Revised AI", revised_ai_txt, height=150, key="dbg_txt2_ai")
+
+
+    # --- Side-by-Side Diff (uses display text) ---
     with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
         st.components.v1.html(st.session_state.diff_html, height=600, scrolling=True)
 
     st.markdown("---")
 
     # --- AI Summary ---
-    st.subheader("🤖 AI-Powered Summary")
-    st.markdown("Click for summary using diff-match-patch analysis.") # Updated text
-    button_disabled = not ai_enabled or (isinstance(st.session_state.get('original_text'), str) and st.session_state.get('original_text', "").startswith("ERROR:")) \
-                      or (isinstance(st.session_state.get('revised_text'), str) and st.session_state.get('revised_text', "").startswith("ERROR:")) \
-                      or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
+    st.subheader("🤖 AI-Powered Summary of Content Changes")
+    st.markdown("Click for summary using hyper-cleaned text comparison.") # Updated text
+    # Disable button checks based on AI text versions
+    button_disabled = not ai_enabled or (isinstance(st.session_state.get('original_text_ai'), str) and st.session_state.get('original_text_ai', "").startswith("ERROR:")) \
+                      or (isinstance(st.session_state.get('revised_text_ai'), str) and st.session_state.get('revised_text_ai', "").startswith("ERROR:")) \
+                      or st.session_state.get('original_text_ai') is None or st.session_state.get('revised_text_ai') is None
 
-    summary_button_label = "✨ Get Filtered Summary (diff-match-patch)" # Updated label
+    summary_button_label = "✨ Get Content Changes Summary" # Updated label
     if st.session_state.get('summary') is not None: summary_button_label = "🔄 Regenerate Summary"
 
     if st.button(summary_button_label, use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
-        if st.session_state.get('original_text') is not None and st.session_state.get('revised_text') is not None:
-            with st.spinner("Analyzing changes using diff-match-patch..."): # Updated spinner
-                summary_result = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
+        # Use the HYPER-CLEANED texts stored in state
+        if st.session_state.get('original_text_ai') is not None and st.session_state.get('revised_text_ai') is not None:
+            with st.spinner("Analyzing content changes..."):
+                summary_result = get_ai_summary(st.session_state.original_text_ai, st.session_state.revised_text_ai)
                 st.session_state['summary'] = summary_result
                 st.rerun()
-        else: st.error("Cannot generate summary: Cleaned text missing.")
+        else: st.error("Cannot generate summary: Hyper-cleaned text missing.")
 
     # --- Display Summary (Using Formatted Display Logic - unchanged) ---
     if st.session_state.get('summary') is not None:
@@ -348,11 +413,10 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
               st.info(summary_text.replace("INFO: ", ""))
          else:
             try:
+                # Parsing logic remains the same
                 sections = {}
                 current_section_key = None
-                # Match the H4 headers from the prompt
                 headers_map = {
-                    # Updated based on latest prompt
                     "#### Clinically Significant Changes (Added/Deleted Content)": "significant",
                     "#### Other Added Content": "added",
                     "#### Other Deleted Content": "deleted"
@@ -372,46 +436,40 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                              matched_header = True
                              break
                     if matched_header: continue
-                    # Handle list items and 'None found' text
                     if current_section_key and line_strip.startswith('* '):
                          sections[current_section_key].append(line_strip[2:].strip())
                     elif current_section_key and line_strip and "none found" in line_strip.lower():
-                         sections[current_section_key].append(line_strip) # Keep 'None found' as is
+                         sections[current_section_key].append(line_strip)
 
-
-                st.markdown("### Categorized Summary (diff-match-patch Filtered):") # Updated title
+                st.markdown("### Categorized Summary of Content Changes:") # Updated title
                 for key, display_name in header_display.items():
                     st.markdown(f'<p class="summary-header">{display_name}</p>', unsafe_allow_html=True)
                     if key in sections and sections[key]:
                         items = sections[key]
-                        # Check if the only item is 'None found'
                         if len(items) == 1 and "none found" in items[0].lower():
-                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*") # Display 'None found' nicely
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*")
                         else:
                             for item in items:
-                                # Apply styling based on +/- prefix
                                 if item.startswith('+'):
                                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-add'>{item}</span>", unsafe_allow_html=True)
                                 elif item.startswith('-'):
                                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-del'>{item}</span>", unsafe_allow_html=True)
                                 else:
-                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}") # Fallback for unexpected format
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}")
                     else:
-                         st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # Default if section is entirely missing
-
-
+                         st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*")
             except Exception as e:
                 st.error(f"Failed to parse AI summary format. Raw output:\nError: {e}")
-                st.markdown(f"```markdown\n{summary_text}\n```") # Fallback
-
+                st.markdown(f"```markdown\n{summary_text}\n```")
 
     # Explain disabled button state
     elif button_disabled and not st.session_state.get('processing_comparison'):
          if not ai_enabled: st.warning("AI Summary disabled: API Key missing/invalid.")
-         elif (isinstance(st.session_state.get('original_text'), str) and st.session_state.get('original_text', "").startswith("ERROR:")) or \
-              (isinstance(st.session_state.get('revised_text'), str) and st.session_state.get('revised_text', "").startswith("ERROR:")):
-             st.warning("AI Summary disabled: Text extraction failed.")
-         elif st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None:
+         # Check AI text versions for failure
+         elif (isinstance(st.session_state.get('original_text_ai'), str) and st.session_state.get('original_text_ai', "").startswith("ERROR:")) or \
+              (isinstance(st.session_state.get('revised_text_ai'), str) and st.session_state.get('revised_text_ai', "").startswith("ERROR:")):
+             st.warning("AI Summary disabled: Text extraction failed (AI version).")
+         elif st.session_state.get('original_text_ai') is None or st.session_state.get('revised_text_ai') is None:
              st.warning("AI Summary disabled: Click 'Compare Documents' first.")
 
 # Handle Errors / Loading State
