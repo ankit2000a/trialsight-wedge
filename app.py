@@ -160,7 +160,7 @@ def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     return style + html
 
 def get_ai_summary(text1, text2):
-    """Generates a summary of changes using the Gemini API."""
+    """Generates a summary of ALL changes using the Gemini API."""
     if not ai_enabled:
         return "AI Summary feature is not available."
 
@@ -169,7 +169,6 @@ def get_ai_summary(text1, text2):
         return "AI Summary cannot be generated because text extraction failed."
 
     # Generate the diff based on the minimally cleaned text
-    # We still need to split lines for the diff algorithm
     lines1 = text1.splitlines(keepends=True)
     lines2 = text2.splitlines(keepends=True)
     diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised'))
@@ -177,38 +176,24 @@ def get_ai_summary(text1, text2):
     # Filter for actual change lines (+ or -), ignoring context and file headers
     diff_text_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
 
-    # --- MORE ROBUST CHECK FOR SUBSTANTIVE CHANGES ---
-    # Check if there are any non-whitespace characters in the change lines
-    substantive_changes_found = any(line[1:].strip() for line in diff_text_lines)
+    # Check if *any* difference was found
+    changes_found = bool(diff_text_lines)
 
-    if not substantive_changes_found:
-        # Check if the original diff had *any* lines, even whitespace, to differentiate
-        if diff_text_lines: # Diff exists but only whitespace/empty lines changed
-             return "No substantive textual differences were found. Detected differences relate only to minor formatting (e.g., line breaks, spacing)."
-        else: # Absolutely no difference found by diff
-             return "No textual differences were found between the documents."
-
+    if not changes_found:
+         return "No textual differences were found between the documents after minimal cleaning."
 
     # Join the filtered lines for the prompt
     diff_text = "".join(diff_text_lines)
 
-
-    # --- PROMPT (keeping the robust instructions) ---
+    # --- UPDATED PROMPT: Ask for ALL details ---
     prompt = f"""
-    You are an expert clinical trial protocol reviewer. Your task is to analyze the textual differences between two versions of a document and summarize ONLY the most significant, substantive modifications.
+    You are a document comparison assistant. Your task is to analyze the textual differences between two versions of a document and list ALL detected changes.
 
     **Instructions:**
-    1.  **Focus ONLY on these key areas:**
-        * Inclusion/Exclusion criteria
-        * Dosage information or treatment schedules
-        * Study procedures or assessments
-        * Safety reporting requirements
-        * Key objectives or endpoints
-    2.  **Explicitly IGNORE:** Minor grammatical corrections, formatting changes (like line breaks, minor spacing differences, indentation), rephrasing that doesn't alter clinical meaning, and minor character variations (like ligatures 'fi' vs 'f' + 'i'). Even if the diff shows changes related to these, do not report them as key changes.
-    3.  **Output Format:**
-        * If you find significant changes in the key areas based on the diff provided, provide a concise, bulleted list detailing ONLY those changes under the heading "**Summary of Key Changes:**".
-        * If the ONLY changes detected in the diff provided relate to the ignored categories (formatting, minor grammar, etc.), state: "No substantive changes were found in the key clinical areas. Detected differences relate only to minor formatting or wording variations."
-        * If you find BOTH substantive changes AND minor ignored changes in the diff, FIRST list the substantive changes under the heading "**Summary of Key Changes:**" and THEN add a brief note like: "Other minor formatting or wording variations were also present but ignored."
+    1.  Review the provided differences line by line.
+    2.  Generate a detailed, bulleted list describing *every* change indicated by the '+' (added) and '-' (removed) lines.
+    3.  Do NOT filter or ignore any changes, including formatting, spacing, punctuation, grammar, or minor wording variations. Report everything you see in the diff.
+    4.  Structure the output clearly under the heading "**List of All Detected Changes:**".
 
     **Detected Textual Differences:**
     (Lines starting with '+' were added, lines with '-' were removed in the revised version. Minimal cleaning applied before diffing.)
@@ -216,7 +201,7 @@ def get_ai_summary(text1, text2):
     {diff_text[:8000]}
     ---
 
-    Begin Summary:
+    Begin List:
     """
 
     try:
@@ -364,13 +349,14 @@ if not st.session_state.get('processing_comparison', False) and st.session_state
 
     # --- AI Summary (Now requires button click again) ---
     st.subheader("🤖 AI-Powered Summary")
-    st.markdown("Click the button below for a summary of the key changes identified in the documents.")
+    st.markdown("Click the button below for a summary of ALL changes identified in the documents.") # Updated text
 
     # Disable button if AI isn't enabled OR if text extraction failed
     button_disabled = not ai_enabled or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
 
-    if st.button("✨ Get Summary", use_container_width=True, disabled=button_disabled, key="generate_summary"):
-        with st.spinner("Analyzing changes with Gemini AI... This might take a moment."):
+    # --- Updated button text ---
+    if st.button("✨ Get Detailed Summary", use_container_width=True, disabled=button_disabled, key="generate_summary"):
+        with st.spinner("Analyzing ALL changes with Gemini AI... This might take a moment."):
             # Add a small delay to ensure state updates if needed, although usually not necessary
             # time.sleep(0.1)
             summary = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
@@ -379,7 +365,8 @@ if not st.session_state.get('processing_comparison', False) and st.session_state
 
     # Display the summary if it exists in the session state
     if st.session_state.get('summary'):
-         st.markdown("### Summary of Changes:")
+         # --- Updated Summary Title ---
+         st.markdown("### Detailed List of Changes:")
          # Display summary, handling potential errors returned from get_ai_summary
          summary_text = st.session_state.summary
          if "Error:" in summary_text:
