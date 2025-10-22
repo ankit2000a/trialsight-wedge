@@ -95,18 +95,27 @@ try:
     # Attempt to get API key from environment variables first, then secrets
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key and hasattr(st, 'secrets'): # Check if st.secrets exists
-         api_key = st.secrets.get("GOOGLE_API_KEY")
+         # Use the secrets management provided by Streamlit
+         secrets = st.secrets
+         if "GOOGLE_API_KEY" in secrets:
+            api_key = secrets["GOOGLE_API_KEY"]
+
 
     if api_key:
         genai.configure(api_key=api_key)
-        # --- SWITCH BACK TO 2.5 MODEL ---
-        model = genai.GenerativeModel('gemini-2.5-pro') # Using the model you found previously
+        # --- Using 2.5 PRO MODEL ---
+        model = genai.GenerativeModel('gemini-2.5-pro')
         ai_enabled = True # Assume enabled if configuration works
     else:
         st.warning("Google API Key not found in environment variables or Streamlit secrets. The AI Summary feature is disabled.")
+        ai_enabled = False # Explicitly disable if no key
 
 except ImportError:
-    st.warning("Streamlit secrets management not available in this environment. Ensure API key is set as an environment variable.")
+    st.warning("Streamlit secrets management not available in this environment. Ensure API key is set as an environment variable if running locally without secrets.")
+    ai_enabled = False # Disable if secrets can't be imported
+except AttributeError:
+    # Fallback if st.secrets doesn't exist (older Streamlit versions?)
+    st.warning("Streamlit secrets attribute not found. Ensure API key is set as an environment variable.")
     ai_enabled = False
 except Exception as e:
     ai_enabled = False
@@ -120,14 +129,22 @@ def extract_text_from_bytes(file_bytes, filename="file"):
     """Extracts and performs MINIMAL cleaning text from PDF bytes."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "\n".join(page.get_text() for page in doc)
+        text = "\n".join(page.get_text("text", sort=True) for page in doc) # Added sort=True
 
         # --- SIMPLIFIED CLEANING Steps ---
-        # Fix common PDF ligature issues (like 'fi' -> 'fl')
-        text = re.sub(r'ﬁ', 'fi', text)
-        text = re.sub(r'ﬂ', 'fl', text)
+        # Fix common PDF ligature issues
+        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
 
-        # Remove leading/trailing whitespace from the whole text block
+        # Basic whitespace cleanup: replace multiple spaces/tabs with single space, but keep newlines
+        text = re.sub(r'[ \t]+', ' ', text)
+        # Remove leading/trailing whitespace from each line
+        lines = text.splitlines()
+        cleaned_lines = [line.strip() for line in lines]
+        text = "\n".join(cleaned_lines)
+        # Remove multiple blank lines
+        text = re.sub(r'\n\s*\n', '\n', text)
+
+        # Remove leading/trailing whitespace from the whole text block AFTER line processing
         text = text.strip()
         # --- END SIMPLIFIED CLEANING Steps ---
 
@@ -152,15 +169,15 @@ def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     <style>
     table.diff { font-family: monospace; border-collapse: collapse; width: 100%; }
     .diff_header { background-color: #374151; color: #E5E7EB; }
-    .diff_add { background-color: #052e16; }
-    .diff_chg { background-color: #4d380c; }
-    .diff_sub { background-color: #4c1d1d; }
+    .diff_add { background-color: rgba(16, 185, 129, 0.2); color: #6EE7B7; text-decoration: none; } /* Green for additions */
+    .diff_chg { background-color: rgba(209, 163, 23, 0.2); color: #FCD34D; } /* Yellow for changes */
+    .diff_sub { background-color: rgba(239, 68, 68, 0.2); color: #FCA5A5; text-decoration: line-through; } /* Red for deletions */
     </style>
     """
     return style + html
 
 def get_ai_summary(text1, text2):
-    """Generates a summary categorizing changes using the Gemini API."""
+    """Generates a summary categorizing added/deleted lines using the Gemini API."""
     if not ai_enabled:
         return "AI Summary feature is not available."
 
@@ -171,9 +188,10 @@ def get_ai_summary(text1, text2):
     # Generate the diff based on the minimally cleaned text
     lines1 = text1.splitlines(keepends=True)
     lines2 = text2.splitlines(keepends=True)
-    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised'))
+    # Use context=0 to only get changed lines
+    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=0))
 
-    # Filter for actual change lines (+ or -), ignoring context and file headers
+    # Filter for actual change lines (+ or -), ignoring file headers
     # Also ignore lines that are purely whitespace changes after the +/-
     diff_text_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++')) and line[1:].strip()]
 
@@ -189,32 +207,32 @@ def get_ai_summary(text1, text2):
             return "No textual differences were found between the documents after minimal cleaning."
 
 
-    # Join the filtered lines for the prompt
-    diff_text = "".join(diff_text_lines)
+    # Join the *meaningful* lines for the prompt
+    diff_text = "".join(meaningful_diff_lines)
 
-    # --- UPDATED PROMPT: Categorize changes ---
+    # --- REFINED PROMPT ---
     prompt = f"""
-    You are an expert clinical trial protocol reviewer. Analyze the textual differences between two versions of a document and categorize them into significant clinical changes and minor formatting/wording changes.
+    You are a document comparison assistant focusing on changes in a revised clinical trial protocol. Analyze the ADDED (+) and DELETED (-) lines provided below, which represent the difference between an original and a revised document.
 
     **Instructions:**
-    1.  **Identify Clinically Significant Changes:** Review the provided differences and identify ONLY changes related to these key areas:
+    1.  **Identify Clinically Significant Additions/Deletions:** Review the ADDED (+) and DELETED (-) lines. Identify ONLY those lines that represent additions or deletions related to these key clinical trial areas:
         * Inclusion/Exclusion criteria
         * Dosage information or treatment schedules
         * Study procedures or assessments
         * Safety reporting requirements
         * Key objectives or endpoints
-    2.  **Identify Minor Changes:** Identify ALL OTHER changes, such as formatting (spacing, indentation, minor punctuation), grammatical corrections, or rephrasing that does not alter clinical meaning.
-    3.  **IGNORE Blank Lines:** Do NOT report the addition or removal of lines containing only whitespace.
+        Try to determine the section or context (e.g., "Inclusion Criteria section") where the change occurred based on surrounding text in the original document (not explicitly provided here, but infer if possible).
+    2.  **Identify Other Additions/Deletions:** Identify ALL OTHER ADDED (+) or DELETED (-) lines provided below that DO NOT fall into the clinically significant category. This includes changes to references, general text, titles, etc.
+    3.  **IGNORE:** Do NOT report changes *within* a line (only whole added/deleted lines). Do NOT report the addition/removal of blank lines or lines containing only whitespace.
     4.  **Output Format:** Structure your response EXACTLY as follows:
 
-        **Clinically Significant Changes:**
-        * [List ONLY the significant changes found in the key areas here. If none, state "None found."]
+        **Clinically Significant Changes in Revised Document:**
+        * [List ONLY the significant ADDED (+) or DELETED (-) lines here, mentioning the context/location if possible (e.g., "+ Added age requirement (10-50) in Inclusion Criteria"). If none, state "None found."]
 
-        **Minor Formatting/Wording Changes:**
-        * [List ALL other detected changes here (excluding blank lines). If none, state "None found."]
+        **Other Added/Deleted Lines in Revised Document:**
+        * [List ALL OTHER non-blank ADDED (+) or DELETED (-) lines here. If none, state "None found."]
 
-    **Detected Textual Differences:**
-    (Lines starting with '+' were added, lines with '-' were removed in the revised version. Minimal cleaning applied before diffing. Blank line changes are excluded from this list.)
+    **Detected Added (+) and Deleted (-) Lines (excluding blank lines):**
     ---
     {diff_text[:8000]}
     ---
@@ -222,28 +240,60 @@ def get_ai_summary(text1, text2):
     Begin Summary:
     """
 
+
     try:
-        # Basic API call
+        # Basic API call with safety settings
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         ]
-        response = model.generate_content(prompt, safety_settings=safety_settings)
+        # Keep temperature slightly lower for consistency
+        generation_config = genai.types.GenerationConfig(temperature=0.2)
+
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+
 
         if not response.candidates:
-             feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else None
-             block_reason = feedback.block_reason if feedback and hasattr(feedback, 'block_reason') else "Unknown"
-             return f"Error: AI response blocked. Reason: {block_reason}. The prompt or content might violate safety policies."
+             # More detailed feedback extraction
+             block_reason = "Unknown"
+             safety_ratings_str = "N/A"
+             if hasattr(response, 'prompt_feedback'):
+                 feedback = response.prompt_feedback
+                 if hasattr(feedback, 'block_reason'):
+                    block_reason = feedback.block_reason
+                 if hasattr(feedback, 'safety_ratings'):
+                     safety_ratings_str = ", ".join([f"{rating.category}: {rating.probability}" for rating in feedback.safety_ratings])
+
+             return (f"Error: AI response blocked. Reason: {block_reason}. "
+                     f"Safety Ratings: [{safety_ratings_str}]. The prompt or content might violate safety policies.")
+
 
         if response.text:
             return response.text.strip()
         else:
-            return "Error: AI model returned an empty response."
+             # Check if blocked due to safety even if candidates exist but text is empty
+            finish_reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
+            if finish_reason == 'SAFETY':
+                 safety_ratings_str = ", ".join([f"{rating.category}: {rating.probability}" for rating in response.candidates[0].safety_ratings])
+                 return f"Error: AI model returned an empty response, potentially due to safety filters. Finish Reason: {finish_reason}. Safety Ratings: [{safety_ratings_str}]"
+            else:
+                 return f"Error: AI model returned an empty response. Finish Reason: {finish_reason}"
+
 
     except Exception as e:
-        return f"Error communicating with the AI model: {e}"
+        # More specific error handling if possible
+        error_message = f"Error communicating with the AI model: {e}"
+        # You could check for specific error types, e.g., related to quotas
+        if "quota" in str(e).lower():
+             error_message += "\nThis might be a quota issue. Please check your API key usage and limits."
+        return error_message
+
 
 # --- Main App UI ---
 st.title("📄 TrialSight: Document Comparator")
@@ -323,6 +373,7 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                 if text1 is not None and text2 is not None:
                     st.session_state['original_text'] = text1
                     st.session_state['revised_text'] = text2
+                    # Generate diff only if text extraction succeeded
                     st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name)
                 else:
                     # Error is handled in extract_text_from_bytes, ensure state is clean
@@ -339,8 +390,8 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 
 
             st.session_state.processing_comparison = False # Reset flag after processing
-            # Only rerun if extraction didn't fail, otherwise errors might loop
-            if st.session_state.get('original_text') is not None:
+            # Rerun only if extraction and diff generation didn't fail
+            if st.session_state.get('diff_html') and "Error:" not in st.session_state.diff_html:
                  st.rerun() # Rerun to display results
 
 
@@ -368,14 +419,14 @@ if not st.session_state.get('processing_comparison', False) and st.session_state
     # --- AI Summary (Now requires button click again) ---
     st.subheader("🤖 AI-Powered Summary")
     # Updated description based on new prompt
-    st.markdown("Click the button below for a categorized summary of changes.")
+    st.markdown("Click the button below for a categorized summary of added/deleted lines.")
 
     # Disable button if AI isn't enabled OR if text extraction failed
     button_disabled = not ai_enabled or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
 
     # --- Updated button text ---
-    if st.button("✨ Get Categorized Summary", use_container_width=True, disabled=button_disabled, key="generate_summary"):
-        with st.spinner("Analyzing and categorizing changes with Gemini AI..."):
+    if st.button("✨ Get Categorized Line Summary", use_container_width=True, disabled=button_disabled, key="generate_summary"):
+        with st.spinner("Analyzing and categorizing added/deleted lines..."):
             summary = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
             st.session_state['summary'] = summary
             st.rerun() # Rerun to display the summary immediately
@@ -383,13 +434,15 @@ if not st.session_state.get('processing_comparison', False) and st.session_state
     # Display the summary if it exists in the session state
     if st.session_state.get('summary'):
          # --- Updated Summary Title ---
-         st.markdown("### Categorized Summary of Changes:")
+         st.markdown("### Categorized Summary of Added/Deleted Lines:")
          # Display summary, handling potential errors returned from get_ai_summary
          summary_text = st.session_state.summary
          if "Error:" in summary_text:
              st.error(summary_text)
          else:
-             st.markdown(summary_text) # AI output should already be formatted with headings
+             # Use markdown with code block for better readability of +/- lines
+             st.markdown(f"```markdown\n{summary_text}\n```")
+
 
     # Explain why button might be disabled more clearly
     elif button_disabled:
@@ -406,3 +459,4 @@ elif st.session_state.get('processing_comparison', False):
 # Display error message if diff generation itself failed
 elif st.session_state.get('diff_html') and "Error:" in st.session_state.get('diff_html', ""):
     st.error(st.session_state.diff_html)
+
