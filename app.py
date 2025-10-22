@@ -1,11 +1,11 @@
 import streamlit as st
 import fitz  # PyMuPDF
-# import difflib # No longer needed for HTML diff
+# import difflib # Using DMP now
 import os
 import time
 import re
 import unicodedata # For robust normalization
-import diff_match_patch as dmp_module # Use DMP for visual diff now
+import diff_match_patch as dmp_module
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -15,146 +15,327 @@ st.set_page_config(
 )
 
 # --- App Styling (CSS) ---
-# Updated CSS for DMP output
+# (CSS Styles - collapsed)
 st.markdown("""
 <style>
     .stApp { background-color: #0E1117; color: #E2E8F0; }
     .stButton>button { border-radius: 0.5rem; }
-    .stFileUploader { border: 2px dashed #4A5568; background-color: #1A202C; border-radius: 0.5rem; padding: 2rem; text-align: center; }
-    .file-card { background-color: #2D3748; border-radius: 0.5rem; padding: 1rem; border: 1px solid #4A5568; display: flex; justify-content: space-between; align-items: center; }
+    /* Make uploader less intrusive when files are loaded */
+    .stFileUploader.st-emotion-cache-1gulkj5 { border: none; padding: 0; }
+    .stFileUploader > div:first-child { padding-top: 0; } /* Reduce top padding */
+    /* Hide default upload text/button when files ARE loaded */
+    .stFileUploader [data-testid="stFileUploadDropzone"] button { display: none; }
+    .stFileUploader [data-testid="stFileUploadDropzone"] p { display: none; }
 
-    /* Styles for diff-match-patch HTML output */
-    .diff-container {
-        font-family: Consolas, 'Courier New', monospace;
-        font-size: 0.9em;
-        line-height: 1.4;
-        border: 1px solid #4A5568;
-        border-radius: 0.5rem;
-        padding: 1rem;
-        background-color: #1A202C; /* Match uploader background */
-        overflow-x: auto; /* Allow horizontal scroll if needed */
-        white-space: pre-wrap; /* Preserve whitespace and wrap */
-        word-wrap: break-word;
-    }
-    ins { /* Insertions */
-        background-color: rgba(16, 185, 129, 0.2); /* Lighter Green background */
-        color: #A7F3D0; /* Green text */
-        text-decoration: none;
-    }
-    del { /* Deletions */
-        background-color: rgba(239, 68, 68, 0.2); /* Lighter Red background */
-        color: #FECACA; /* Red text */
-        text-decoration: none; /* Remove strikethrough for background highlight */
-        /* Optional: Add subtle underline */
-        /* border-bottom: 1px dotted rgba(239, 68, 68, 0.6); */
-    }
+
+    .file-card { background-color: #2D3748; border-radius: 0.5rem; padding: 0.8rem 1rem; border: 1px solid #4A5568; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;}
+    /* Diff (using DMP prettyHTML styles) */
+    .diff-container { font-family: Consolas, 'Courier New', monospace; font-size: 0.9em; line-height: 1.4; border: 1px solid #4A5568; border-radius: 0.5rem; padding: 1rem; background-color: #1A202C; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }
+    ins { background-color: rgba(16, 185, 129, 0.2); color: #A7F3D0; text-decoration: none; }
+    del { background-color: rgba(239, 68, 68, 0.2); color: #FECACA; text-decoration: none; }
+    /* Summary Styles */
+    .summary-add { color: #6EE7B7; }
+    .summary-del { color: #FCA5A5; text-decoration: line-through; }
+    .summary-header { font-weight: bold; margin-top: 0.8em; margin-bottom: 0.3em; color: #9CA3AF; } /* Header color */
+    .summary-item { margin-left: 1.5em; text-indent: -1.5em; margin-bottom: 0.3em;} /* Hanging indent */
+    .summary-context { font-style: italic; color: #6B7280; font-size: 0.9em; } /* Context style */
 
     /* Loader */
     .loader-container { display: flex; justify-content: center; align-items: center; flex-direction: column; margin: 20px 0; }
     .loader { border: 4px solid #4b5563; border-left-color: #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .stMarkdown code { white-space: pre-wrap !important; background-color: #1f2937; padding: 0.5em; border-radius: 0.3em; font-size: 0.9em; display: block; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # --- Session State Initialization ---
 def init_session_state():
-    # Simplified state
-    keys = ['file1_data', 'file2_data', 'diff_html_output', # Renamed state key
-            'original_text_normalized', 'revised_text_normalized',
+    # Using only one normalized text version now
+    keys = ['file1_data', 'file2_data', 'diff_html_output', 'summary',
+            'original_text_normalized', 'revised_text_normalized', # Keep single normalized version state
             'processing_comparison']
     for key in keys:
         if key not in st.session_state: st.session_state[key] = None
     if st.session_state.processing_comparison is None: st.session_state.processing_comparison = False
 init_session_state()
 
-# --- NO AI CONFIGURATION NEEDED FOR THIS VERSION ---
+# --- Gemini API Configuration ---
+# (Remains the same - checks secrets then env var)
+ai_enabled = False
+api_key = None
+try:
+    api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets else None
+    api_key_env = os.environ.get("GOOGLE_API_KEY")
+    api_key = api_key_secret or api_key_env
+    if api_key:
+        genai.configure(api_key=api_key)
+        if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
+             try: st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+             except Exception: st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Fallback
+        model = st.session_state.gemini_model
+        ai_enabled = True
+    else: st.warning("Google API Key not found. AI Summary disabled."); ai_enabled = False
+except Exception as e:
+    ai_enabled = False; st.warning(f"Could not initialize Google AI: {e}")
+    if 'gemini_model' in st.session_state: st.session_state.gemini_model = None
 
 # --- Helper Functions ---
 
-# --- USING CHATGPT'S NORMALIZATION FUNCTION ---
+# --- USING PRECISE CHATGPT NORMALIZATION FUNCTION ---
 @st.cache_data
 def normalize_pdf_text(file_bytes, filename="file"):
     """
     Extracts and normalizes text preserving line structure, joining broken words.
-    Based on user-provided ChatGPT suggestion.
+    Based on user-provided ChatGPT suggestion. Handles PDF or TXT input.
     """
+    text = ""
+    is_pdf = filename.lower().endswith('.pdf')
     try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "\n".join(page.get_text("text", sort=True) for page in doc)
-        if not text: return f"ERROR: No text found in PDF {filename}"
-        # Normalization steps...
+        if is_pdf:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page_texts = [page.get_text("text", sort=True) or "" for page in doc]
+            text = "\n".join(page_texts)
+            doc.close()
+        else: # Handle plain text file
+             text = file_bytes.decode('utf-8', errors='ignore') # Ignore decoding errors
+
+        if not text:
+             print(f"Warning: No raw text extracted from {filename}")
+             return f"ERROR: No text found in file {filename}"
+
+        # 1. Normalize weird Unicode (NFKC handles ligatures, etc.)
         text = unicodedata.normalize("NFKC", text)
-        text = re.sub(r'([a-z])\n([a-z])', r'\1\2', text, flags=re.IGNORECASE)
-        text = re.sub(r'-\n', '', text)
+
+        # 2. Fix words broken by a newline (Pu\nblishers → Publishers)
+        #    Only join if both sides seem like word characters, handle optional space
+        text = re.sub(r'([a-zA-Z0-9])\s*\n\s*([a-zA-Z0-9])', r'\1\2', text)
+
+        # 3. Fix hyphenated words broken by newline (state-\n -> state-)
+        text = re.sub(r'-\s*\n\s*', '', text) # Remove newline and surrounding space after hyphen
+
+        # 4. Replace multiple spaces/tabs with a single space (preserves newlines for now)
         text = re.sub(r'[ \t]+', ' ', text)
+
+        # 5. Normalize line endings (essential before splitting)
         text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+        # 6. Remove leading/trailing spaces on each line
         lines = text.split('\n')
         stripped_lines = [line.strip() for line in lines]
+
+        # 7. Remove blank lines (lines that become empty after stripping)
         non_blank_lines = [line for line in stripped_lines if line]
         text = '\n'.join(non_blank_lines)
+
+        # 8. Final strip for the whole text block
         text = text.strip()
-        # --- REMOVED LOWERCASE STEP FOR VISUAL DIFF ---
-        # text = text.lower() # Keep case for visual diff
-        if not text: return f"ERROR: Text became empty after normalization for {filename}"
+
+        # 9. Convert to lowercase AFTER structural changes (for AI comparison consistency)
+        text_lower = text.lower()
+
+
+        if not text:
+             print(f"Warning: Text became empty after normalization for {filename}")
+             return f"ERROR: Text became empty after normalization for {filename}", None # Return tuple
+        # Return both original case (for display/HTML diff) and lower case (for AI diff input)
+        # CRITICAL CHANGE: Return ONLY the normalized text with original case for BOTH uses.
+        # Let DMP handle case differences if needed, simplifying state.
         return text
+
     except Exception as e:
         print(f"Error normalizing {filename}: {e}")
+        # Return tuple of errors
         return f"ERROR: Could not read/normalize {filename}. Details: {e}"
 
-# --- NEW FUNCTION using diff-match-patch for HTML ---
+
+# --- Use diff-match-patch for HTML ---
 def generate_dmp_diff_html(text1_norm, text2_norm):
-    """Creates highlighted HTML diff using diff-match-patch."""
-    if text1_norm is None or text2_norm is None or text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
+    """Creates highlighted HTML diff using diff-match-patch on normalized text."""
+    if text1_norm is None or text2_norm is None or \
+       text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
          return "<p style='color:red;'>Error: Cannot generate visual diff (text normalization failed).</p>"
     try:
         dmp = dmp_module.diff_match_patch()
-        dmp.Diff_Timeout = 2.0 # Increase timeout slightly for potentially complex diffs
+        dmp.Diff_Timeout = 2.0
+        # Use normalized text (original case, preserved lines) for visual diff
         diffs = dmp.diff_main(text1_norm, text2_norm)
-        # cleanupSemantic can sometimes merge small changes, might be useful
-        dmp.diff_cleanupSemantic(diffs)
-        # cleanupEfficiency optimizes diffs further, might reduce noise slightly
-        dmp.diff_cleanupEfficiency(diffs)
+        dmp.diff_cleanupSemantic(diffs) # Makes diff more human-readable
 
         html = dmp.diff_prettyHtml(diffs)
-        # Wrap in a container div for styling and overflow control
+        # Wrap in styled container
         return f"<div class='diff-container'>{html}</div>"
     except Exception as e:
         print(f"Error generating DMP HTML diff: {e}")
-        # Return error message formatted as HTML
         return f"<p style='color:red;'>Error: Failed to generate visual comparison using diff-match-patch. {e}</p>"
 
 
+def get_ai_summary(text1_norm, text2_norm):
+    """Generates a categorized summary using AI based on normalized diff_match_patch comparison."""
+    # --- Input Validation ---
+    if not ai_enabled: return "AI Summary feature is not available (API key issue)."
+    # Check the normalized text versions
+    if text1_norm is None or text2_norm is None or \
+       (isinstance(text1_norm, str) and text1_norm.startswith("ERROR:")) or \
+       (isinstance(text2_norm, str) and text2_norm.startswith("ERROR:")):
+        return "AI Summary cannot be generated: text normalization failed."
+
+    # --- Use diff_match_patch on the CORRECTLY NORMALIZED text ---
+    # Convert to lowercase SPECIFICALLY for the AI comparison step to ignore case
+    text1_lower = text1_norm.lower()
+    text2_lower = text2_norm.lower()
+
+    dmp = dmp_module.diff_match_patch()
+    dmp.Diff_Timeout = 1.0
+    try:
+        diffs = dmp.diff_main(text1_lower, text2_lower) # Use lowercase versions for AI input diff
+        dmp.diff_cleanupSemantic(diffs)
+    except Exception as dmp_err:
+         print(f"Error during diff_match_patch: {dmp_err}")
+         if text1_lower == text2_lower: return "INFO: No textual differences found after robust normalization."
+         else: return f"ERROR: Failed to compute differences using diff_match_patch: {dmp_err}."
+
+    # --- Extract ONLY true additions and deletions for the AI ---
+    meaningful_diff_fragments_for_ai = []
+    MIN_FRAGMENT_LEN = 3 # Filter very short fragments (often noise)
+    for op, data in diffs:
+        # Normalize whitespace WITHIN the fragment for cleaner AI input, then strip
+        data_clean = re.sub(r'\s+', ' ', data).strip()
+        if not data_clean or len(data_clean) < MIN_FRAGMENT_LEN: continue
+
+        prefix = ""
+        if op == dmp.DIFF_INSERT: prefix = "+"
+        elif op == dmp.DIFF_DELETE: prefix = "-"
+        else: continue # Skip equal parts
+
+        meaningful_diff_fragments_for_ai.append(f"{prefix}{data_clean}\n") # Add newline separator
+
+
+    # --- Handle No Differences Case ---
+    if not meaningful_diff_fragments_for_ai:
+         if text1_lower == text2_lower:
+            return "INFO: No textual differences were found between the documents after robust normalization."
+         else:
+             # If texts weren't identical but no fragments met criteria
+             return "INFO: No significant content changes detected by diff_match_patch after robust normalization. Only minor variations might exist."
+
+
+    diff_text_for_prompt = "".join(meaningful_diff_fragments_for_ai)
+
+    # --- AI Prompt (v23 - Using correctly normalized DMP diff fragments, focus on content) ---
+    prompt = f"""
+    Analyze the provided ADDED (+) and DELETED (-) content fragments from a comparison of two normalized clinical trial protocols (lowercase, rejoined words, normalized whitespace). Categorize these fragments based on potential clinical significance, ignoring minor variations.
+
+    **Instructions:**
+    1.  **Focus on Meaning:** Identify ADDED (+) or DELETED (-) fragments that represent a *substantive change* in meaning or requirements.
+    2.  **Clinically Significant:** Prioritize changes clearly related to: Inclusion/Exclusion criteria, Dosage/Treatment, Procedures/Assessments, Safety reporting, or Objectives/Endpoints. List these first with brief context.
+    3.  **Other Substantive Changes:** List other ADDED/DELETED fragments that change the actual content (not just trivial wording differences).
+    4.  **IGNORE Noise:** Explicitly IGNORE fragments that are likely just minor rephrasing, single common word substitutions (a/the), isolated numbers/symbols, or artifacts of normalization if they don't change the core meaning.
+    5.  **Output Format:** Structure your response EXACTLY like this:
+
+        #### Clinically Significant Changes (Added/Deleted Content)
+        * [List ONLY significant ADDED (+) or DELETED (-) content here, with brief justification. If none found, state "None found."]
+
+        #### Other Substantive Added Content
+        * [List ALL OTHER clearly ADDED (+) content fragments here. If none found, state "None found."]
+
+        #### Other Substantive Deleted Content
+        * [List ALL OTHER clearly DELETED (-) content fragments here. If none found, state "None found."]
+
+    **Meaningful Added (+) and Deleted (-) Content Fragments (Robustly Normalized):**
+    ---
+    {diff_text_for_prompt[:8000]}
+    ---
+
+    Begin Summary:
+    """
+
+
+    try:
+        # Safety settings and generation config remain the same
+        safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+        generation_config = genai.types.GenerationConfig(temperature=0.1)
+        if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
+             return "ERROR: Gemini model not initialized."
+        model = st.session_state.gemini_model
+        response = model.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
+
+        # Robust response handling (unchanged)
+        if not response.candidates:
+            block_reason = "Unknown";
+            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'): block_reason = response.prompt_feedback.block_reason
+            return f"ERROR: AI response blocked. Reason: {block_reason}."
+        candidate = response.candidates[0]
+        finish_reason = candidate.finish_reason if hasattr(candidate, 'finish_reason') else "Unknown"
+        if candidate.content and candidate.content.parts and candidate.content.parts[0].text:
+             response_text = candidate.content.parts[0].text.strip()
+             return response_text
+        else:
+             safety_ratings_str = "N/A"
+             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'): safety_ratings_str = ", ".join([f"{r.category.name}: {r.probability.name}" for r in candidate.safety_ratings])
+             return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}. Safety Ratings: [{safety_ratings_str}]"
+    except Exception as e:
+        error_message = f"ERROR: Failed to get AI summary: {e}"
+        if "quota" in str(e).lower() or "429" in str(e): error_message += "\n(Quota exceeded?)"
+        return error_message
+
 # --- Main App UI ---
-st.title("📄 TrialSight: Document Content Comparator") # Updated title slightly
-st.markdown("Highlights **content changes** between two PDFs, ignoring most formatting differences.") # Updated description
+st.title("📄 TrialSight: Document Content Comparator")
+st.markdown("Highlights content changes between two documents using robust text normalization.")
 st.markdown("---")
 
 # File Uploader & Display Logic
-if not st.session_state.get('file1_data') and not st.session_state.get('file2_data'):
-    uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True, key="file_uploader")
-    if uploaded_files:
-        if len(uploaded_files) != 2: st.warning("Please upload exactly two files.")
-        else:
-            st.session_state.file1_data = uploaded_files[0]
-            st.session_state.file2_data = uploaded_files[1]
-            # Clear all results on new upload
-            keys_to_clear = ['diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
+# Use columns for better layout after files uploaded
+uploader_col, clear_col = st.columns([0.85, 0.15])
+
+with uploader_col:
+    if not st.session_state.get('file1_data') or not st.session_state.get('file2_data'):
+        uploaded_files = st.file_uploader(
+            "Upload Original & Revised Files (PDF or TXT)",
+            type=["pdf", "txt"], # Allow TXT
+            accept_multiple_files=True,
+            key="file_uploader"
+            )
+        if uploaded_files:
+            if len(uploaded_files) != 2: st.warning("Please upload exactly two files.")
+            else:
+                st.session_state.file1_data = uploaded_files[0]
+                st.session_state.file2_data = uploaded_files[1]
+                # Clear all results on new upload
+                keys_to_clear = ['diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
+                for key in keys_to_clear:
+                    if key in st.session_state: del st.session_state[key]
+                st.session_state.processing_comparison = False
+                st.rerun() # Rerun immediately after upload
+    else:
+        # Display file cards if files are loaded
+        col1, col2 = st.columns(2)
+        file1_name = st.session_state.file1_data.name if st.session_state.get('file1_data') else "N/A"
+        file2_name = st.session_state.file2_data.name if st.session_state.get('file2_data') else "N/A"
+        with col1:
+             st.markdown(f"""
+             <div class="file-card">
+                 <span>Original: <strong>{file1_name}</strong></span>
+             </div>
+             """, unsafe_allow_html=True)
+        with col2:
+             st.markdown(f"""
+             <div class="file-card">
+                 <span>Revised: <strong>{file2_name}</strong></span>
+             </div>
+             """, unsafe_allow_html=True)
+
+# Place clear button separately
+with clear_col:
+     if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
+        # Add some top margin to align better with file cards
+        st.markdown('<div style="margin-top: 1rem;"></div>', unsafe_allow_html=True)
+        if st.button("Clear", key="clear_btn", use_container_width=True):
+            keys_to_clear = ['file1_data', 'file2_data', 'diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
             for key in keys_to_clear:
                 if key in st.session_state: del st.session_state[key]
-            st.session_state.processing_comparison = False
             st.rerun()
-else:
-    col1, col2 = st.columns(2)
-    file1_name = st.session_state.file1_data.name if st.session_state.get('file1_data') else "N/A"
-    file2_name = st.session_state.file2_data.name if st.session_state.get('file2_data') else "N/A"
-    with col1: st.success(f"Original: **{file1_name}**")
-    with col2: st.success(f"Revised: **{file2_name}**")
-    if st.button("Clear Files and Start Over"):
-        keys_to_clear = ['file1_data', 'file2_data', 'diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
-        for key in keys_to_clear:
-            if key in st.session_state: del st.session_state[key]
-        st.rerun()
+
 
 # --- Comparison Logic ---
 if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
@@ -177,55 +358,154 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
             if file1 and file2:
                 file1_bytes = file1.getvalue()
                 file2_bytes = file2.getvalue()
+                file1_is_pdf = file1.name.lower().endswith('.pdf')
+                file2_is_pdf = file2.name.lower().endswith('.pdf')
 
                 # --- Extract NORMALIZED text using the CORRECT function ---
-                text1_norm = normalize_pdf_text(file1_bytes, file1.name)
+                # Returns tuple: (display_text, lower_text) or (error_msg, None)
+                # But we only need the display text now, as lowercasing is done in get_ai_summary
+                text1_norm = normalize_pdf_text(file1_bytes, file1.name) # Use the correct function
                 text2_norm = normalize_pdf_text(file2_bytes, file2.name)
 
-                # Store normalized text
+                # Store normalized text (original case version)
                 st.session_state['original_text_normalized'] = text1_norm
                 st.session_state['revised_text_normalized'] = text2_norm
 
-                # Generate HTML diff using DMP (handles internal errors)
+                # Generate HTML diff using normalized text (handles internal errors)
                 st.session_state['diff_html_output'] = generate_dmp_diff_html(text1_norm, text2_norm)
             else:
-                st.session_state['diff_html_output'] = "<p style='color:red;'>Error: File data missing.</p>" # Error as HTML
-                st.session_state['summary'] = None # Ensure summary is cleared too
+                st.session_state['diff_html_output'] = "<p style='color:red;'>Error: File data missing.</p>"
+                st.session_state['summary'] = None
             st.session_state.processing_comparison = False # Reset flag
             # Rerun regardless of diff success to show either diff or error
             st.rerun()
 
 
 # --- Display Results Section ---
-# Display diff if processing is done and diff_html_output exists
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html_output'):
 
-    # --- DEBUGGER (Shows the robustly normalized text) ---
-    with st.expander("Show/Hide Normalized Text (Used for Comparison)"):
-        col1, col2 = st.columns(2)
-        original_display = st.session_state.get('original_text_normalized', "Not available")
-        revised_display = st.session_state.get('revised_text_normalized', "Not available")
-        # Display potentially long text in text_area for scrollability
-        with col1: st.subheader("Original (Normalized)"); st.text_area("Original Norm", original_display, height=200, key="dbg_txt1_norm")
-        with col2: st.subheader("Revised (Normalized)"); st.text_area("Revised Norm", revised_display, height=200, key="dbg_txt2_norm")
+     # Check if diff generation itself resulted in an error message
+    if isinstance(st.session_state.diff_html_output, str) and st.session_state.diff_html_output.strip().lower().startswith("<p style='color:red;'>error:"):
+        st.error("Failed to generate visual comparison:")
+        st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True) # Display the HTML error
+    else:
+        # --- DEBUGGER (Shows the robustly normalized text) ---
+        with st.expander("Show/Hide Normalized Text (Used for Comparison)"):
+            col1, col2 = st.columns(2)
+            original_display = st.session_state.get('original_text_normalized', "Not available")
+            revised_display = st.session_state.get('revised_text_normalized', "Not available")
+            # Display potentially long text in text_area for scrollability
+            with col1: st.subheader("Original (Normalized)"); st.text_area("Original Norm", original_display, height=200, key="dbg_txt1_norm")
+            with col2: st.subheader("Revised (Normalized)"); st.text_area("Revised Norm", revised_display, height=200, key="dbg_txt2_norm")
 
 
-    # --- Visual Diff using diff-match-patch output ---
-    st.subheader("Visual Comparison of Content Changes")
-    st.markdown("*(Green = Added, Red Background = Deleted. Formatting differences are ignored)*") # Updated note
-    # Use st.markdown with unsafe_allow_html=True for the DMP output
-    st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True)
+        # --- Visual Diff using diff-match-patch output ---
+        st.subheader("Visual Comparison of Content Changes")
+        st.markdown("*(Green = Added, Red = Deleted. Formatting differences ignored due to normalization)*")
+        st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True) # Display DMP HTML
 
-    # --- AI Summary Section REMOVED ---
-    # st.markdown("---")
-    # st.subheader("🤖 AI-Powered Summary of Content Changes")
-    # ... (All AI summary button and display logic removed) ...
+        st.markdown("---")
 
+        # --- AI Summary ---
+        st.subheader("🤖 AI-Powered Summary of Content Changes")
+        st.markdown("Click for summary based on normalized/filtered comparison.")
+        # Disable button checks based on normalized text versions
+        button_disabled = not ai_enabled or \
+                          (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")) or \
+                          (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")) or \
+                          st.session_state.get('original_text_normalized') is None or st.session_state.get('revised_text_normalized') is None
+
+        summary_button_label = "✨ Get Content Changes Summary"
+        if st.session_state.get('summary') is not None: summary_button_label = "🔄 Regenerate Summary"
+
+        if st.button(summary_button_label, use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
+            # Use the ROBUSTLY NORMALIZED texts stored in state
+            if st.session_state.get('original_text_normalized') is not None and st.session_state.get('revised_text_normalized') is not None:
+                with st.spinner("Analyzing content changes..."):
+                    summary_result = get_ai_summary(st.session_state.original_text_normalized, st.session_state.revised_text_normalized)
+                    st.session_state['summary'] = summary_result
+                    st.rerun()
+            else: st.error("Cannot generate summary: Normalized text missing.")
+
+        # --- Display Summary (Using Formatted Display Logic - unchanged) ---
+        if st.session_state.get('summary') is not None:
+             summary_text = st.session_state.summary
+             st.markdown("---") # Add separator
+             if summary_text.startswith("ERROR:") or "cannot be generated" in summary_text or "not available" in summary_text:
+                 st.error(summary_text)
+             elif summary_text.startswith("INFO:") or "No textual differences" in summary_text or "No substantive" in summary_text:
+                  st.info(summary_text.replace("INFO: ", ""))
+             else:
+                try:
+                    # Parsing logic remains the same
+                    sections = {}
+                    current_section_key = None
+                    headers_map = { # Ensure these match the AI prompt's H4 headers
+                        "#### Clinically Significant Changes (Added/Deleted Content)": "significant",
+                        "#### Other Substantive Added Content": "added", # Match prompt
+                        "#### Other Substantive Deleted Content": "deleted" # Match prompt
+                    }
+                    header_display = {
+                         "significant": "Clinically Significant Changes (Added/Deleted Content)",
+                         "added": "Other Substantive Added Content",
+                         "deleted": "Other Substantive Deleted Content"
+                    }
+                    for line in summary_text.splitlines():
+                        line_strip = line.strip()
+                        matched_header = False
+                        for md_header, key in headers_map.items():
+                            if line_strip == md_header:
+                                 current_section_key = key
+                                 sections[current_section_key] = []
+                                 matched_header = True
+                                 break
+                        if matched_header: continue
+                        if current_section_key and line_strip.startswith('* '):
+                             item_text = line_strip[2:].strip()
+                             sections[current_section_key].append(item_text)
+                        elif current_section_key and line_strip and "none found" in line_strip.lower():
+                             sections[current_section_key].append(line_strip)
+
+                    st.markdown("### Categorized Summary of Content Changes:") # Updated title
+                    for key, display_name in header_display.items():
+                        st.markdown(f'<p class="summary-header">{display_name}</p>', unsafe_allow_html=True)
+                        if key in sections and sections[key]:
+                            items = sections[key]
+                            if len(items) == 1 and "none found" in items[0].lower():
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*")
+                            else:
+                                for item in items:
+                                    # Added check for item existence before prefix check
+                                    if item and item.startswith('+'):
+                                        # Use div wrapper for better layout control
+                                        st.markdown(f"<div class='summary-item'><span class='summary-add'>{item}</span></div>", unsafe_allow_html=True)
+                                    elif item and item.startswith('-'):
+                                        st.markdown(f"<div class='summary-item'><span class='summary-del'>{item}</span></div>", unsafe_allow_html=True)
+                                    elif item: # Don't apply color if no prefix (e.g., justification text from AI)
+                                        st.markdown(f"<div class='summary-item'>{item}</div>", unsafe_allow_html=True)
+                        else:
+                             st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # Display None found if section is missing or truly empty
+                except Exception as e:
+                    st.error(f"Failed to parse AI summary format. Raw output:\nError: {e}")
+                    st.markdown(f"```markdown\n{summary_text}\n```") # Fallback to raw
+
+        # Explain disabled button state
+        elif button_disabled and not st.session_state.get('processing_comparison'):
+             if not ai_enabled: st.warning("AI Summary disabled: API Key missing/invalid.")
+             # Check normalized text versions for failure
+             elif (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")) or \
+                  (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")):
+                 st.warning("AI Summary disabled: Text normalization failed.")
+             elif st.session_state.get('original_text_normalized') is None or st.session_state.get('revised_text_normalized') is None:
+                 st.warning("AI Summary disabled: Click 'Compare Documents' first.")
 
 # Handle Errors / Loading State
-elif st.session_state.get('processing_comparison'):
-     st.markdown('<div class="loader-container"><div class="loader"></div><p>Processing...</p></div>', unsafe_allow_html=True)
-# Display error if diff generation failed (now diff_html_output contains the HTML error)
-elif not st.session_state.get('processing_comparison') and st.session_state.get('diff_html_output'):
+elif st.session_state.get('diff_html_output') and isinstance(st.session_state.get('diff_html_output'), str) and st.session_state.get('diff_html_output', "").strip().lower().startswith("<p style='color:red;'>error:"):
+    # Display error from generate_dmp_diff_html if it occurred
+     st.markdown("---") # Add separator before error
+     st.error("Failed to generate visual comparison:")
      st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True)
+elif st.session_state.get('processing_comparison'):
+     # Show spinner if the processing flag is set
+     st.markdown('<div class="loader-container"><div class="loader"></div><p>Processing...</p></div>', unsafe_allow_html=True)
 
