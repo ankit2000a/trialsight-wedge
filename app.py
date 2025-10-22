@@ -23,9 +23,9 @@ st.markdown("""
     .stFileUploader { border: 2px dashed #4A5568; background-color: #1A202C; border-radius: 0.5rem; padding: 2rem; text-align: center; }
     .file-card { background-color: #2D3748; border-radius: 0.5rem; padding: 1rem; border: 1px solid #4A5568; display: flex; justify-content: space-between; align-items: center; }
     /* Diff Table Styles */
-    .diff_add { background-color: rgba(16, 185, 129, 0.08); }
-    .diff_chg { background-color: rgba(209, 163, 23, 0.08); }
-    .diff_sub { background-color: rgba(239, 68, 68, 0.08); text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); }
+    .diff_add { background-color: rgba(16, 185, 129, 0.15); color: #A7F3D0; }
+    .diff_chg { background-color: rgba(209, 163, 23, 0.15); color: #FDE68A; }
+    .diff_sub { background-color: rgba(239, 68, 68, 0.15); color: #FECACA; text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); }
     table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; }
     .diff_header { background-color: #374151; color: #E5E7EB; padding: 0.2em 0.5em; font-weight: bold; position: sticky; top: 0; z-index: 10;}
     td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; }
@@ -79,37 +79,21 @@ except Exception as e:
 
 @st.cache_data
 def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts text, preserving paragraphs (double newlines)."""
+    """Extracts text with minimal cleaning, preserving line structure for diff."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = ""
-        for page_num, page in enumerate(doc):
-            blocks = page.get_text("blocks")
-            blocks.sort(key=lambda b: (b[1], b[0])) # Sort blocks
-            page_text = ""
-            last_y1 = 0
-            for b in blocks:
-                x0, y0, x1, y1, block_text, block_no, block_type = b
-                # Add paragraph break if significant vertical space, ignore if it's the first block on page
-                if y0 - last_y1 > 15 and page_text:
-                    page_text += "\n\n"
-                cleaned_block = block_text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
-                cleaned_block = re.sub(r'[ \t]+', ' ', cleaned_block)
-                cleaned_block = cleaned_block.strip()
-                # Append if block has content
-                if cleaned_block:
-                    page_text += cleaned_block + " " # Add space between blocks
-                last_y1 = y1
-            # Add page break marker (optional, could help context)
-            # text += page_text.strip() + f"\n\n--- Page {page_num + 1} ---\n\n"
-            text += page_text.strip() + "\n\n" # Simpler page break
-
-        # Final cleanup
+        text = "\n".join(page.get_text("text", sort=True) for page in doc)
+        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
         text = text.replace('\r\n', '\n').replace('\r', '\n')
+        # Keep internal spaces, just normalize multiple spaces to one
         text = re.sub(r'[ \t]+', ' ', text)
-        text = re.sub(r'\n\s*\n+', '\n\n', text) # Collapse multiple newlines to max two
+        lines = text.splitlines()
+        # Strip leading/trailing whitespace from lines
+        cleaned_lines = [line.strip() for line in lines]
+        text = "\n".join(cleaned_lines)
+        # Collapse multiple blank lines to one
+        text = re.sub(r'\n(\s*\n)+', '\n\n', text)
         text = text.strip()
-
         if not text:
              print(f"Warning: No text extracted from {filename}")
              return f"ERROR: No text found in PDF {filename}"
@@ -120,14 +104,12 @@ def extract_text_from_bytes(file_bytes, filename="file"):
 
 
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
-    """Creates side-by-side HTML diff using paragraph-preserved text."""
+    """Creates side-by-side HTML diff."""
     if text1 is None or text2 is None or text1.startswith("ERROR:") or text2.startswith("ERROR:"):
          return "Error: Cannot generate diff (text extraction failed)."
     try:
-        lines1 = text1.splitlines()
-        lines2 = text2.splitlines()
         html = difflib.HtmlDiff(wrapcolumn=80, tabsize=4).make_table(
-            lines1, lines2, fromdesc=filename1, todesc=filename2
+            text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2
         )
         style = f"<style>{difflib.HtmlDiff._styles}</style>"
         custom_style = """
@@ -146,61 +128,92 @@ def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
         print(f"Error generating HTML diff: {e}")
         return f"Error: Failed to generate visual comparison. {e}"
 
-# Keep the robust noise filter function
-def normalize_text_for_noise_check(text):
-    if not isinstance(text, str): return ""
-    text = text.lower()
-    text = re.sub(r'\s+', '', text)
-    return text
+def extract_words(text):
+    """Extracts lowercase words from a string."""
+    if not isinstance(text, str): return []
+    # Find words (sequences of letters/numbers), ignore case
+    return re.findall(r'\b\w+\b', text.lower())
 
-def filter_reformatting_noise(diff_lines):
-    filtered = []
+def filter_noise_by_word_comparison(diff_lines, similarity_threshold=0.95):
+    """
+    Filters +/- diff lines by comparing word sequences in changed blocks.
+    Keeps blocks where word sequences differ significantly.
+    """
+    filtered_meaningful_lines = []
     i = 0
     n = len(diff_lines)
     while i < n:
         line = diff_lines[i]
-        if not line.startswith(('-', '+')): i += 1; continue
+        # Skip non-change lines or lines already processed within a block
+        if not line.startswith(('-', '+')):
+            i += 1
+            continue
+
+        # Find the end of the current block of consecutive +/- lines
         block_end = i
         while block_end + 1 < n and diff_lines[block_end + 1].startswith(('-', '+')):
             block_end += 1
-        deleted_block = [l[1:] for l in diff_lines[i : block_end + 1] if l.startswith('-')]
-        added_block = [l[1:] for l in diff_lines[i : block_end + 1] if l.startswith('+')]
-        deleted_content = normalize_text_for_noise_check(" ".join(deleted_block))
-        added_content = normalize_text_for_noise_check(" ".join(added_block))
-        if deleted_content != added_content:
-            for k in range(i, block_end + 1):
-                if diff_lines[k][1:].strip():
-                    filtered.append(diff_lines[k])
+
+        # Extract the original lines corresponding to this block
+        current_block_lines = diff_lines[i : block_end + 1]
+
+        # Extract words from deleted and added lines within the block
+        deleted_words = []
+        added_words = []
+        for l in current_block_lines:
+            content = l[1:] # Text after '+' or '-'
+            words = extract_words(content)
+            if l.startswith('-'):
+                deleted_words.extend(words)
+            elif l.startswith('+'):
+                added_words.extend(words)
+
+        # Use SequenceMatcher to compare the word sequences
+        matcher = difflib.SequenceMatcher(None, deleted_words, added_words, autojunk=False)
+        ratio = matcher.ratio()
+
+        # If the word sequences are substantially DIFFERENT, keep the block
+        if ratio < similarity_threshold:
+            # Add only the non-blank lines from this block to the final list
+            for l in current_block_lines:
+                if l[1:].strip(): # Ensure the line wasn't just whitespace
+                    filtered_meaningful_lines.append(l)
+
+        # Move index past the processed block
         i = block_end + 1
-    return filtered
+
+    return filtered_meaningful_lines
 
 
 def get_ai_summary(text1, text2):
-    """Generates a categorized summary using AI after robust noise filtering."""
+    """Generates a categorized summary using AI after word-based noise filtering."""
     # --- Input Validation ---
     if not ai_enabled: return "AI Summary feature is not available (API key issue)."
     if text1 is None or text2 is None or (isinstance(text1, str) and text1.startswith("ERROR:")) or (isinstance(text2, str) and text2.startswith("ERROR:")):
         return "AI Summary cannot be generated: text extraction failed."
 
-    # --- Diff Generation & Noise Filtering ---
+    # --- Diff Generation & NEW Noise Filtering ---
     lines1 = text1.splitlines(keepends=True)
     lines2 = text2.splitlines(keepends=True)
-    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=0)) # n=0 important for filter
+    # n=0 needed to get only diff lines for the filter
+    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=0))
     raw_diff_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
-    filtered_diff_lines = filter_reformatting_noise(raw_diff_lines) # Apply robust filter
+
+    # --- Apply the NEW word-comparison filter ---
+    filtered_diff_lines = filter_noise_by_word_comparison(raw_diff_lines, similarity_threshold=0.95) # Adjust threshold if needed
 
     # --- Handle No Differences Case ---
     if not filtered_diff_lines:
          if any(line[1:].strip() for line in raw_diff_lines):
-             return "INFO: No substantive textual differences found. Changes detected relate primarily to text reformatting."
+             return "INFO: No substantive content changes found. Differences detected appear to be primarily due to text reformatting or minor variations."
          else:
             return "INFO: No textual differences were found between the documents after cleaning."
 
     diff_text_for_prompt = "".join(filtered_diff_lines)
 
-    # --- Prompt v10 (Keep the 3 categories, simpler instructions) ---
+    # --- AI Prompt (v11 - Using word-filtered diff) ---
     prompt = f"""
-    Analyze the provided ADDED (+) and DELETED (-) lines, which represent meaningful content changes between two clinical trial protocol versions (reformatting noise has been pre-filtered). Categorize these changes into three groups.
+    Analyze the provided ADDED (+) and DELETED (-) lines, which represent meaningful content changes between two clinical trial protocol versions (reformatting noise has been pre-filtered based on word sequences). Categorize these changes.
 
     **Instructions:**
     1.  **Clinically Significant Lines:** Identify ADDED (+) or DELETED (-) lines clearly related to:
@@ -223,14 +236,13 @@ def get_ai_summary(text1, text2):
         #### Other Deleted Lines
         * [List ALL OTHER non-blank DELETED (-) lines from the input here. If none found, state "None found."]
 
-    **Meaningful Added (+) and Deleted (-) Lines (Reformatting Filtered Out):**
+    **Meaningful Added (+) and Deleted (-) Lines (Reformatting Filtered Out by Word Comparison):**
     ---
     {diff_text_for_prompt[:8000]}
     ---
 
     Begin Summary:
     """
-
 
     try:
         # Safety settings and generation config remain the same
@@ -243,7 +255,7 @@ def get_ai_summary(text1, text2):
         model = st.session_state.gemini_model
         response = model.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
 
-        # --- Process Response --- (Same robust handling as before)
+        # --- Process Response --- (Same robust handling)
         if not response.candidates:
             block_reason = "Unknown"
             if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'): block_reason = response.prompt_feedback.block_reason
@@ -258,7 +270,7 @@ def get_ai_summary(text1, text2):
     except Exception as e:
         error_message = f"ERROR: Failed to get AI summary: {e}"
         if "quota" in str(e).lower() or "429" in str(e): error_message += "\n(Quota exceeded?)"
-        # Return error string for display, don't show Streamlit error directly in summary area
+        # Return error string for display
         return error_message
 
 
@@ -294,6 +306,7 @@ else:
 
 # --- Comparison Logic ---
 if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
+    # Show Compare button only if needed
     if not st.session_state.get('diff_html') and not st.session_state.get('processing_comparison'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
             st.session_state.processing_comparison = True
@@ -302,19 +315,22 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                  if key in st.session_state: del st.session_state[key]
             st.rerun()
 
+    # Execute comparison if flagged
     if st.session_state.get('processing_comparison'):
         with st.spinner("Reading, cleaning, and comparing documents..."):
             time.sleep(0.5) # Ensure spinner shows
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             if file1 and file2:
+                # Use the extraction function (handles errors internally)
                 text1 = extract_text_from_bytes(file1.getvalue(), file1.name)
                 text2 = extract_text_from_bytes(file2.getvalue(), file2.name)
                 st.session_state['original_text'] = text1
                 st.session_state['revised_text'] = text2
-                st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name)
+                st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name) # Handles internal errors
             else: st.session_state['diff_html'] = "Error: File data missing."; st.session_state['summary'] = None
-            st.session_state.processing_comparison = False
+            st.session_state.processing_comparison = False # Reset flag
+            # Rerun only if diff generation didn't return an error string
             if isinstance(st.session_state.get('diff_html'), str) and not st.session_state.get('diff_html', "").startswith("Error:"):
                  st.rerun()
 
@@ -323,7 +339,7 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and isinstance(st.session_state.get('diff_html'), str) and not st.session_state.get('diff_html', "").startswith("Error:"):
 
     # --- DEBUGGER ---
-    with st.expander("Show/Hide Extracted Text (Cleaned for Diff)"): # Renamed
+    with st.expander("Show/Hide Extracted Text (Cleaned for Diff)"):
         col1, col2 = st.columns(2)
         original_display = st.session_state.get('original_text') if isinstance(st.session_state.get('original_text'), str) else "Extraction Error or Not Run"
         revised_display = st.session_state.get('revised_text') if isinstance(st.session_state.get('revised_text'), str) else "Extraction Error or Not Run"
@@ -338,26 +354,26 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
 
     # --- AI Summary ---
     st.subheader("🤖 AI-Powered Summary")
-    st.markdown("Click for summary of significant changes (noise filtered by paragraph).")
+    st.markdown("Click for summary (noise filtered by word comparison).") # Updated text
     button_disabled = not ai_enabled or (isinstance(st.session_state.get('original_text'), str) and st.session_state.get('original_text', "").startswith("ERROR:")) \
                       or (isinstance(st.session_state.get('revised_text'), str) and st.session_state.get('revised_text', "").startswith("ERROR:")) \
                       or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
 
-    summary_button_label = "✨ Get Filtered Summary (Paragraph Aware)"
+    summary_button_label = "✨ Get Filtered Summary (Word Aware)" # Updated label
     if st.session_state.get('summary') is not None: summary_button_label = "🔄 Regenerate Summary"
 
     if st.button(summary_button_label, use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
         if st.session_state.get('original_text') is not None and st.session_state.get('revised_text') is not None:
-            with st.spinner("Analyzing changes..."):
+            with st.spinner("Analyzing changes (filtering noise)..."):
                 summary_result = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
                 st.session_state['summary'] = summary_result
                 st.rerun()
         else: st.error("Cannot generate summary: Cleaned text missing.")
 
-    # --- NEW SUMMARY DISPLAY LOGIC ---
+    # --- Display Summary (Using Formatted Display Logic) ---
     if st.session_state.get('summary') is not None:
          summary_text = st.session_state.summary
-         st.markdown("---") # Add a separator
+         st.markdown("---") # Add separator
 
          # Handle Info/Error messages first
          if summary_text.startswith("ERROR:") or "cannot be generated" in summary_text or "not available" in summary_text:
@@ -367,56 +383,62 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
          # Attempt to parse and display formatted summary
          else:
             try:
+                # Simplified parsing assuming H4 headers
                 sections = {}
-                current_section = None
-                lines = summary_text.splitlines()
+                current_section_key = None
+                headers_map = { # Map markdown headers to simpler keys
+                    "#### Clinically Significant Changes (Added/Deleted Lines)": "significant",
+                    "#### Other Added Lines": "added",
+                    "#### Other Deleted Lines": "deleted"
+                }
+                header_display = { # How to display the headers
+                     "significant": "Clinically Significant Changes (Added/Deleted Lines)",
+                     "added": "Other Added Lines",
+                     "deleted": "Other Deleted Lines"
+                }
 
-                # Define expected headers based on the prompt
-                headers = [
-                    "#### Clinically Significant Changes (Added/Deleted Lines)",
-                    "#### Other Added Lines",
-                    "#### Other Deleted Lines"
-                ]
 
-                # Parse lines into sections based on headers
-                for line in lines:
+                for line in summary_text.splitlines():
                     line_strip = line.strip()
-                    if line_strip in headers:
-                        current_section = line_strip
-                        sections[current_section] = []
-                    elif current_section and line_strip.startswith('* '):
-                         sections[current_section].append(line_strip[2:].strip()) # Store content after '* '
-                    elif current_section and line_strip and not line_strip.startswith("---"): # Capture potential continuation lines or 'None found.'
-                         # Check if it's the "None found" message
-                         if "none found" in line_strip.lower():
-                             sections[current_section].append(line_strip)
-                         # If the list is not empty and last item wasn't "None found", append as continuation
-                         elif sections[current_section] and "none found" not in sections[current_section][-1].lower():
-                             sections[current_section][-1] += " " + line_strip
-                         else: # Otherwise, treat as a new item (or handle as unexpected format)
-                              sections[current_section].append(line_strip)
+                    matched_header = False
+                    for md_header, key in headers_map.items():
+                        if line_strip == md_header:
+                             current_section_key = key
+                             sections[current_section_key] = []
+                             matched_header = True
+                             break
+                    if matched_header: continue # Skip header lines
+
+                    # Add lines to the current section
+                    if current_section_key and line_strip.startswith('* '):
+                         sections[current_section_key].append(line_strip[2:].strip())
+                    elif current_section_key and line_strip and "none found" in line_strip.lower(): # Capture 'None found'
+                         sections[current_section_key].append(line_strip) # Keep 'None found' as is
 
 
-                # Display parsed sections
-                for header in headers:
-                    st.markdown(f'<p class="summary-header">{header.replace("#### ", "")}</p>', unsafe_allow_html=True)
-                    if header in sections and sections[header]:
-                        for item in sections[header]:
-                            if "none found" in item.lower():
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{item}*") # Indent and italicize 'None found'
-                            elif item.startswith('+'):
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-add'>+ {item[1:].strip()}</span>", unsafe_allow_html=True)
-                            elif item.startswith('-'):
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-del'>- {item[1:].strip()}</span>", unsafe_allow_html=True)
-                            else:
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}") # Display unexpected format as is
+                # Display parsed sections nicely
+                st.markdown("### Categorized Summary (Word Filtered):") # Main Title
+                for key, display_name in header_display.items():
+                    st.markdown(f'<p class="summary-header">{display_name}</p>', unsafe_allow_html=True)
+                    if key in sections and sections[key]:
+                        items = sections[key]
+                        if len(items) == 1 and "none found" in items[0].lower():
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*")
+                        else:
+                            for item in items:
+                                if item.startswith('+'):
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-add'>+ {item[1:].strip()}</span>", unsafe_allow_html=True)
+                                elif item.startswith('-'):
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-del'>- {item[1:].strip()}</span>", unsafe_allow_html=True)
+                                else: # Should ideally not happen with +/- input, but handle just in case
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}")
                     else:
                          st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # Default if section missing
 
 
             except Exception as e:
                 st.error(f"Failed to parse AI summary format. Displaying raw output:\nError: {e}")
-                st.markdown(f"```markdown\n{summary_text}\n```") # Fallback to code block
+                st.markdown(f"```markdown\n{summary_text}\n```") # Fallback
 
 
     # Explain disabled button state
