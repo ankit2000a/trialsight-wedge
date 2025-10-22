@@ -114,19 +114,23 @@ def extract_text_from_bytes(file_bytes, filename="file"):
     """Extracts and CLEANS text from PDF bytes."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = " ".join(page.get_text() for page in doc)
+        # --- FIX: Join pages with newlines, not spaces ---
+        text = "\n".join(page.get_text() for page in doc)
         
-        # --- NEW CLEANING STEPS ---
+        # --- UPDATED CLEANING STEPS ---
         # Fix common PDF ligature issues (like 'ﬁ' -> 'fi')
         text = re.sub(r'ﬁ', 'fi', text)
         text = re.sub(r'ﬂ', 'fl', text)
         
-        # Replace all whitespace (spaces, tabs, newlines) with a single space
-        text = re.sub(r'\s+', ' ', text)
+        # Replace tabs and other non-newline whitespace with a single space
+        text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+        
+        # Optional: Collapse multiple blank lines into one
+        text = re.sub(r'\n\s*\n', '\n', text)
         
         # Remove leading/trailing whitespace
         text = text.strip()
-        # --- END NEW CLEANING STEPS ---
+        # --- END UPDATED CLEANING STEPS ---
         
         return text
     except Exception as e:
@@ -135,6 +139,7 @@ def extract_text_from_bytes(file_bytes, filename="file"):
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     """Creates a side-by-side HTML diff of two texts."""
     d = difflib.HtmlDiff(wrapcolumn=80)
+    # --- FIX: This now gets a proper list of lines ---
     html = d.make_table(text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2)
     style = """
     <style>
