@@ -117,33 +117,27 @@ except Exception as e:
 
 @st.cache_data
 def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts and CLEANS text from PDF bytes."""
+    """Extracts and performs MINIMAL cleaning text from PDF bytes."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        # --- FIX: Join pages with newlines, not spaces ---
         text = "\n".join(page.get_text() for page in doc)
 
-        # --- Basic Cleaning Steps ---
+        # --- SIMPLIFIED CLEANING Steps ---
         # Fix common PDF ligature issues (like 'fi' -> 'fl')
         text = re.sub(r'ﬁ', 'fi', text)
         text = re.sub(r'ﬂ', 'fl', text)
 
-        # Replace tabs and multiple spaces with a single space (keep newlines)
-        # Ensure spaces around punctuation for better diffing if needed later, but primary cleaning is simpler
-        text = re.sub(r'[ \t\r\f\v]+', ' ', text)
-
-        # Optional: Collapse multiple blank lines into one
-        text = re.sub(r'\n\s*\n+', '\n', text) # Use + to catch more than two blank lines
-
         # Remove leading/trailing whitespace from the whole text block
         text = text.strip()
-        # --- END Basic Cleaning Steps ---
+        # --- END SIMPLIFIED CLEANING Steps ---
 
+        # Important: Return text preserving internal whitespace and line breaks as much as possible
         return text
     except Exception as e:
         # Provide more context in the error message
         st.error(f"Error reading {filename}: {e}")
         return None # Return None on error
+
 
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     """Creates a side-by-side HTML diff of two texts."""
@@ -174,22 +168,32 @@ def get_ai_summary(text1, text2):
     if text1 is None or text2 is None:
         return "AI Summary cannot be generated because text extraction failed."
 
-    # Generate the diff based on the cleaned text
-    diff = list(difflib.unified_diff(
-        text1.splitlines(keepends=True),
-        text2.splitlines(keepends=True),
-        fromfile='Original',
-        tofile='Revised',
-    ))
-    diff_text = "".join([line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))])
+    # Generate the diff based on the minimally cleaned text
+    # We still need to split lines for the diff algorithm
+    lines1 = text1.splitlines(keepends=True)
+    lines2 = text2.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised'))
 
-    # Check for substantive changes vs. only minor diffs
-    substantive_changes_found = bool(diff_text.strip()) # Simple check if any diff exists after cleaning
+    # Filter for actual change lines (+ or -), ignoring context and file headers
+    diff_text_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
+
+    # --- MORE ROBUST CHECK FOR SUBSTANTIVE CHANGES ---
+    # Check if there are any non-whitespace characters in the change lines
+    substantive_changes_found = any(line[1:].strip() for line in diff_text_lines)
 
     if not substantive_changes_found:
-        return "No substantive textual differences were found after basic cleaning. Minor variations in spacing or formatting might exist but were ignored."
+        # Check if the original diff had *any* lines, even whitespace, to differentiate
+        if diff_text_lines: # Diff exists but only whitespace/empty lines changed
+             return "No substantive textual differences were found. Detected differences relate only to minor formatting (e.g., line breaks, spacing)."
+        else: # Absolutely no difference found by diff
+             return "No textual differences were found between the documents."
 
-    # --- UPDATED PROMPT (More robust instructions) ---
+
+    # Join the filtered lines for the prompt
+    diff_text = "".join(diff_text_lines)
+
+
+    # --- PROMPT (keeping the robust instructions) ---
     prompt = f"""
     You are an expert clinical trial protocol reviewer. Your task is to analyze the textual differences between two versions of a document and summarize ONLY the most significant, substantive modifications.
 
@@ -200,14 +204,14 @@ def get_ai_summary(text1, text2):
         * Study procedures or assessments
         * Safety reporting requirements
         * Key objectives or endpoints
-    2.  **Explicitly IGNORE:** Minor grammatical corrections, formatting changes (like line breaks, minor spacing differences, indentation), rephrasing that doesn't alter clinical meaning, and minor character variations (like ligatures 'fi' vs 'f' + 'i').
+    2.  **Explicitly IGNORE:** Minor grammatical corrections, formatting changes (like line breaks, minor spacing differences, indentation), rephrasing that doesn't alter clinical meaning, and minor character variations (like ligatures 'fi' vs 'f' + 'i'). Even if the diff shows changes related to these, do not report them as key changes.
     3.  **Output Format:**
-        * If you find significant changes in the key areas, provide a concise, bulleted list detailing ONLY those changes under the heading "**Summary of Key Changes:**".
-        * If the ONLY changes detected relate to the ignored categories (formatting, minor grammar, etc.), state: "No substantive changes were found in the key clinical areas. Detected differences relate only to minor formatting or wording variations."
-        * If you find BOTH substantive changes AND minor ignored changes, FIRST list the substantive changes under the heading "**Summary of Key Changes:**" and THEN add a brief note like: "Other minor formatting or wording variations were also present but ignored."
+        * If you find significant changes in the key areas based on the diff provided, provide a concise, bulleted list detailing ONLY those changes under the heading "**Summary of Key Changes:**".
+        * If the ONLY changes detected in the diff provided relate to the ignored categories (formatting, minor grammar, etc.), state: "No substantive changes were found in the key clinical areas. Detected differences relate only to minor formatting or wording variations."
+        * If you find BOTH substantive changes AND minor ignored changes in the diff, FIRST list the substantive changes under the heading "**Summary of Key Changes:**" and THEN add a brief note like: "Other minor formatting or wording variations were also present but ignored."
 
     **Detected Textual Differences:**
-    (Lines starting with '+' were added, lines with '-' were removed in the revised version. These differences have undergone basic cleaning to reduce formatting noise.)
+    (Lines starting with '+' were added, lines with '-' were removed in the revised version. Minimal cleaning applied before diffing.)
     ---
     {diff_text[:8000]}
     ---
@@ -217,7 +221,6 @@ def get_ai_summary(text1, text2):
 
     try:
         # Basic API call
-        # Adding safety settings for potentially sensitive content, adjust as needed
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -226,23 +229,17 @@ def get_ai_summary(text1, text2):
         ]
         response = model.generate_content(prompt, safety_settings=safety_settings)
 
-        # Check for blocked response due to safety settings or other issues
         if not response.candidates:
-             # Check prompt feedback if available
              feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else None
              block_reason = feedback.block_reason if feedback and hasattr(feedback, 'block_reason') else "Unknown"
              return f"Error: AI response blocked. Reason: {block_reason}. The prompt or content might violate safety policies."
 
-        # Access text safely
         if response.text:
-            return response.text.strip() # Strip any leading/trailing whitespace from AI response
+            return response.text.strip()
         else:
-            # Handle cases where response exists but text is empty
             return "Error: AI model returned an empty response."
 
     except Exception as e:
-        # Catch potential API errors more specifically if possible, else generic message
-        # Example: Check for specific Google API error types if the library provides them
         return f"Error communicating with the AI model: {e}"
 
 # --- Main App UI ---
@@ -315,7 +312,7 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                 file1_bytes = file1.getvalue()
                 file2_bytes = file2.getvalue()
 
-                # Extract single version of text
+                # Extract single version of text with minimal cleaning
                 text1 = extract_text_from_bytes(file1_bytes, file1.name)
                 text2 = extract_text_from_bytes(file2_bytes, file2.name)
 
@@ -405,3 +402,4 @@ elif st.session_state.get('processing_comparison', False):
 # Display error message if diff generation itself failed
 elif st.session_state.get('diff_html') and "Error:" in st.session_state.get('diff_html', ""):
     st.error(st.session_state.diff_html)
+
