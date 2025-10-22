@@ -5,7 +5,32 @@ import os
 import time
 import re
 import unicodedata # For robust normalization
-import diff_match_patch as dmp_module
+# --- ENSURE THESE ARE IMPORTED ---
+try:
+    import google.generativeai as genai
+except ImportError:
+    st.error("ERROR: google.generativeai library not found. Please install it: pip install google-generativeai")
+    # Set dummy genai object to avoid further NameErrors downstream if import fails
+    class DummyGenAI: pass
+    genai = DummyGenAI()
+    genai.GenerativeModel = lambda x: None # Mock the model function
+    api_key = None # Ensure api_key is None if import fails
+    ai_enabled = False
+
+try:
+    import diff_match_patch as dmp_module
+except ImportError:
+    st.error("ERROR: diff-match-patch library not found. Please install it: pip install diff-match-patch")
+    # Set dummy dmp object
+    class DummyDMP:
+        def diff_main(self, t1, t2): return []
+        def diff_cleanupSemantic(self, d): pass
+        def diff_prettyHtml(self, d): return "Error: diff-match-patch not installed."
+        DIFF_INSERT = 1
+        DIFF_DELETE = -1
+        DIFF_EQUAL = 0
+    dmp_module = DummyDMP()
+
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -21,11 +46,11 @@ st.markdown("""
     .stApp { background-color: #0E1117; color: #E2E8F0; }
     .stButton>button { border-radius: 0.5rem; }
     /* Make uploader less intrusive when files are loaded */
-    .stFileUploader.st-emotion-cache-1gulkj5 { border: none; padding: 0; }
-    .stFileUploader > div:first-child { padding-top: 0; } /* Reduce top padding */
+    .stFileUploader > div:has(button[kind="secondary"]) { border: none; padding: 0; }
+    .stFileUploader > div:has(button[kind="secondary"]) > div { padding-top: 0; } /* Reduce top padding */
     /* Hide default upload text/button when files ARE loaded */
-    .stFileUploader [data-testid="stFileUploadDropzone"] button { display: none; }
-    .stFileUploader [data-testid="stFileUploadDropzone"] p { display: none; }
+    .stFileUploader [data-testid="stFileUploadDropzone"]:has(+ div [data-testid="stFileUploaderFile"]) button { display: none; }
+    .stFileUploader [data-testid="stFileUploadDropzone"]:has(+ div [data-testid="stFileUploaderFile"]) p { display: none; }
 
 
     .file-card { background-color: #2D3748; border-radius: 0.5rem; padding: 0.8rem 1rem; border: 1px solid #4A5568; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;}
@@ -53,7 +78,7 @@ st.markdown("""
 def init_session_state():
     # Using only one normalized text version now
     keys = ['file1_data', 'file2_data', 'diff_html_output', 'summary',
-            'original_text_normalized', 'revised_text_normalized', # Keep single normalized version state
+            'original_text_normalized', 'revised_text_normalized',
             'processing_comparison']
     for key in keys:
         if key not in st.session_state: st.session_state[key] = None
@@ -61,24 +86,32 @@ def init_session_state():
 init_session_state()
 
 # --- Gemini API Configuration ---
-# (Remains the same - checks secrets then env var)
+# Moved after imports, includes fallback logic
 ai_enabled = False
 api_key = None
-try:
-    api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets else None
-    api_key_env = os.environ.get("GOOGLE_API_KEY")
-    api_key = api_key_secret or api_key_env
-    if api_key:
-        genai.configure(api_key=api_key)
-        if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
-             try: st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
-             except Exception: st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Fallback
-        model = st.session_state.gemini_model
-        ai_enabled = True
-    else: st.warning("Google API Key not found. AI Summary disabled."); ai_enabled = False
-except Exception as e:
-    ai_enabled = False; st.warning(f"Could not initialize Google AI: {e}")
-    if 'gemini_model' in st.session_state: st.session_state.gemini_model = None
+# Check if genai was imported successfully before trying to use it
+if 'google.generativeai' in sys.modules:
+    try:
+        api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets else None
+        api_key_env = os.environ.get("GOOGLE_API_KEY")
+        api_key = api_key_secret or api_key_env
+        if api_key:
+            genai.configure(api_key=api_key)
+            if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
+                 try: st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+                 except Exception:
+                      st.warning("Failed to initialize gemini-2.5-pro, falling back to gemini-pro.")
+                      st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Fallback
+            model = st.session_state.gemini_model # Assign model from state
+            ai_enabled = True # Enable only if key and model init succeed
+        else:
+            st.warning("Google API Key not found. AI Summary disabled.")
+            ai_enabled = False
+    except Exception as e:
+        ai_enabled = False; st.warning(f"Could not initialize Google AI: {e}")
+        if 'gemini_model' in st.session_state: st.session_state.gemini_model = None # Reset model state on error
+# else: ai_enabled is already False from import failure
+
 
 # --- Helper Functions ---
 
@@ -93,14 +126,19 @@ def normalize_pdf_text(file_bytes, filename="file"):
     is_pdf = filename.lower().endswith('.pdf')
     try:
         if is_pdf:
+            # Added check for empty file bytes
+            if not file_bytes: return f"ERROR: Uploaded PDF file '{filename}' is empty."
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             page_texts = [page.get_text("text", sort=True) or "" for page in doc]
             text = "\n".join(page_texts)
             doc.close()
         else: # Handle plain text file
+             # Added check for empty file bytes
+             if not file_bytes: return f"ERROR: Uploaded TXT file '{filename}' is empty."
              text = file_bytes.decode('utf-8', errors='ignore') # Ignore decoding errors
 
         if not text:
+             # This check might be redundant if the above catches empty files, but keep for safety
              print(f"Warning: No raw text extracted from {filename}")
              return f"ERROR: No text found in file {filename}"
 
@@ -131,21 +169,21 @@ def normalize_pdf_text(file_bytes, filename="file"):
         # 8. Final strip for the whole text block
         text = text.strip()
 
-        # 9. Convert to lowercase AFTER structural changes (for AI comparison consistency)
-        text_lower = text.lower()
+        # 9. DO NOT CONVERT TO LOWERCASE HERE - keep case for visual diff
+        # text_lower = text.lower() # Remove this
 
 
         if not text:
              print(f"Warning: Text became empty after normalization for {filename}")
-             return f"ERROR: Text became empty after normalization for {filename}", None # Return tuple
-        # Return both original case (for display/HTML diff) and lower case (for AI diff input)
-        # CRITICAL CHANGE: Return ONLY the normalized text with original case for BOTH uses.
-        # Let DMP handle case differences if needed, simplifying state.
+             return f"ERROR: Text became empty after normalization for {filename}"
+        # Return ONLY the normalized text with original case
         return text
 
+    except fitz.fitz.FileDataError as fe:
+         print(f"Fitz FileDataError for {filename}: {fe}")
+         return f"ERROR: Could not read PDF '{filename}'. File might be corrupted or password-protected."
     except Exception as e:
         print(f"Error normalizing {filename}: {e}")
-        # Return tuple of errors
         return f"ERROR: Could not read/normalize {filename}. Details: {e}"
 
 
@@ -156,6 +194,10 @@ def generate_dmp_diff_html(text1_norm, text2_norm):
        text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
          return "<p style='color:red;'>Error: Cannot generate visual diff (text normalization failed).</p>"
     try:
+        # Check if dmp_module was imported correctly
+        if not hasattr(dmp_module, 'diff_match_patch'):
+             return "<p style='color:red;'>Error: diff-match-patch library not loaded correctly.</p>"
+
         dmp = dmp_module.diff_match_patch()
         dmp.Diff_Timeout = 2.0
         # Use normalized text (original case, preserved lines) for visual diff
@@ -185,6 +227,10 @@ def get_ai_summary(text1_norm, text2_norm):
     text1_lower = text1_norm.lower()
     text2_lower = text2_norm.lower()
 
+    # Check if dmp_module was imported correctly
+    if not hasattr(dmp_module, 'diff_match_patch'):
+         return "ERROR: diff-match-patch library not loaded correctly."
+
     dmp = dmp_module.diff_match_patch()
     dmp.Diff_Timeout = 1.0
     try:
@@ -204,8 +250,9 @@ def get_ai_summary(text1_norm, text2_norm):
         if not data_clean or len(data_clean) < MIN_FRAGMENT_LEN: continue
 
         prefix = ""
-        if op == dmp.DIFF_INSERT: prefix = "+"
-        elif op == dmp.DIFF_DELETE: prefix = "-"
+        # Check op against dmp constants
+        if op == dmp_module.DIFF_INSERT: prefix = "+"
+        elif op == dmp_module.DIFF_DELETE: prefix = "-"
         else: continue # Skip equal parts
 
         meaningful_diff_fragments_for_ai.append(f"{prefix}{data_clean}\n") # Add newline separator
@@ -253,7 +300,7 @@ def get_ai_summary(text1_norm, text2_norm):
 
     try:
         # Safety settings and generation config remain the same
-        safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+        safety_settings = [ {"category": c.name, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in genai.types.HarmCategory] # Use enum names
         generation_config = genai.types.GenerationConfig(temperature=0.1)
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
              return "ERROR: Gemini model not initialized."
@@ -263,20 +310,24 @@ def get_ai_summary(text1_norm, text2_norm):
         # Robust response handling (unchanged)
         if not response.candidates:
             block_reason = "Unknown";
-            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'): block_reason = response.prompt_feedback.block_reason
+            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'): block_reason = response.prompt_feedback.block_reason.name # Use enum name
             return f"ERROR: AI response blocked. Reason: {block_reason}."
         candidate = response.candidates[0]
-        finish_reason = candidate.finish_reason if hasattr(candidate, 'finish_reason') else "Unknown"
+        finish_reason = candidate.finish_reason.name if hasattr(candidate, 'finish_reason') else "Unknown" # Use enum name
         if candidate.content and candidate.content.parts and candidate.content.parts[0].text:
              response_text = candidate.content.parts[0].text.strip()
              return response_text
         else:
              safety_ratings_str = "N/A"
-             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'): safety_ratings_str = ", ".join([f"{r.category.name}: {r.probability.name}" for r in candidate.safety_ratings])
+             # Updated safety rating access
+             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'):
+                  safety_ratings_str = ", ".join([f"{r.category.name}: {r.probability.name}" for r in candidate.safety_ratings])
              return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}. Safety Ratings: [{safety_ratings_str}]"
     except Exception as e:
         error_message = f"ERROR: Failed to get AI summary: {e}"
         if "quota" in str(e).lower() or "429" in str(e): error_message += "\n(Quota exceeded?)"
+        # Also check for API key validation errors
+        elif "api key not valid" in str(e).lower(): error_message += "\n(Invalid API Key? Check secrets.toml)"
         return error_message
 
 # --- Main App UI ---
@@ -290,6 +341,7 @@ uploader_col, clear_col = st.columns([0.85, 0.15])
 
 with uploader_col:
     if not st.session_state.get('file1_data') or not st.session_state.get('file2_data'):
+        # Only show uploader if files are not loaded
         uploaded_files = st.file_uploader(
             "Upload Original & Revised Files (PDF or TXT)",
             type=["pdf", "txt"], # Allow TXT
@@ -325,11 +377,11 @@ with uploader_col:
              </div>
              """, unsafe_allow_html=True)
 
-# Place clear button separately
+# Place clear button separately, ensure it's visible when files are loaded
 with clear_col:
      if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
         # Add some top margin to align better with file cards
-        st.markdown('<div style="margin-top: 1rem;"></div>', unsafe_allow_html=True)
+        st.markdown('<div style="margin-top: 0.5rem;"></div>', unsafe_allow_html=True) # Adjusted margin
         if st.button("Clear", key="clear_btn", use_container_width=True):
             keys_to_clear = ['file1_data', 'file2_data', 'diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
             for key in keys_to_clear:
@@ -339,11 +391,11 @@ with clear_col:
 
 # --- Comparison Logic ---
 if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
-    # Show Compare button only if needed
+    # Show Compare button only if needed (results not present AND not processing)
     if not st.session_state.get('diff_html_output') and not st.session_state.get('processing_comparison'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
             st.session_state.processing_comparison = True
-            # Clear previous results
+            # Clear previous results explicitly on button press
             keys_to_clear = ['diff_html_output', 'summary', 'original_text_normalized', 'revised_text_normalized']
             for key in keys_to_clear:
                  if key in st.session_state: del st.session_state[key]
@@ -358,16 +410,16 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
             if file1 and file2:
                 file1_bytes = file1.getvalue()
                 file2_bytes = file2.getvalue()
-                file1_is_pdf = file1.name.lower().endswith('.pdf')
-                file2_is_pdf = file2.name.lower().endswith('.pdf')
+                # Determine file types for normalization function
+                file1_type = file1.name.split('.')[-1].lower()
+                file2_type = file2.name.split('.')[-1].lower()
 
                 # --- Extract NORMALIZED text using the CORRECT function ---
-                # Returns tuple: (display_text, lower_text) or (error_msg, None)
-                # But we only need the display text now, as lowercasing is done in get_ai_summary
+                # Changed function name here to use the new one
                 text1_norm = normalize_pdf_text(file1_bytes, file1.name) # Use the correct function
                 text2_norm = normalize_pdf_text(file2_bytes, file2.name)
 
-                # Store normalized text (original case version)
+                # Store normalized text (original case version for display)
                 st.session_state['original_text_normalized'] = text1_norm
                 st.session_state['revised_text_normalized'] = text2_norm
 
@@ -385,9 +437,14 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html_output'):
 
      # Check if diff generation itself resulted in an error message
-    if isinstance(st.session_state.diff_html_output, str) and st.session_state.diff_html_output.strip().lower().startswith("<p style='color:red;'>error:"):
+    # Handle both None and error strings robustly
+    diff_output = st.session_state.diff_html_output
+    is_diff_error = diff_output is None or (isinstance(diff_output, str) and diff_output.strip().lower().startswith("<p style='color:red;'>error:"))
+
+    if is_diff_error:
         st.error("Failed to generate visual comparison:")
-        st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True) # Display the HTML error
+        # Display the HTML error or a default message if None
+        st.markdown(diff_output if diff_output else "<p style='color:red;'>Unknown error generating comparison.</p>", unsafe_allow_html=True)
     else:
         # --- DEBUGGER (Shows the robustly normalized text) ---
         with st.expander("Show/Hide Normalized Text (Used for Comparison)"):
@@ -410,34 +467,38 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
         st.subheader("🤖 AI-Powered Summary of Content Changes")
         st.markdown("Click for summary based on normalized/filtered comparison.")
         # Disable button checks based on normalized text versions
-        button_disabled = not ai_enabled or \
-                          (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")) or \
-                          (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")) or \
-                          st.session_state.get('original_text_normalized') is None or st.session_state.get('revised_text_normalized') is None
+        # Check for None AND error strings now
+        norm_text_ok = True
+        if st.session_state.get('original_text_normalized') is None or (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")): norm_text_ok = False
+        if st.session_state.get('revised_text_normalized') is None or (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")): norm_text_ok = False
+
+        button_disabled = not ai_enabled or not norm_text_ok
+
 
         summary_button_label = "✨ Get Content Changes Summary"
         if st.session_state.get('summary') is not None: summary_button_label = "🔄 Regenerate Summary"
 
         if st.button(summary_button_label, use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
             # Use the ROBUSTLY NORMALIZED texts stored in state
-            if st.session_state.get('original_text_normalized') is not None and st.session_state.get('revised_text_normalized') is not None:
+            if norm_text_ok:
                 with st.spinner("Analyzing content changes..."):
                     summary_result = get_ai_summary(st.session_state.original_text_normalized, st.session_state.revised_text_normalized)
                     st.session_state['summary'] = summary_result
                     st.rerun()
-            else: st.error("Cannot generate summary: Normalized text missing.")
+            else: st.error("Cannot generate summary: Normalized text missing or invalid.")
 
         # --- Display Summary (Using Formatted Display Logic - unchanged) ---
         if st.session_state.get('summary') is not None:
              summary_text = st.session_state.summary
              st.markdown("---") # Add separator
+             # Check for specific error/info prefixes
              if summary_text.startswith("ERROR:") or "cannot be generated" in summary_text or "not available" in summary_text:
-                 st.error(summary_text)
+                 st.error(summary_text) # Display as error
              elif summary_text.startswith("INFO:") or "No textual differences" in summary_text or "No substantive" in summary_text:
-                  st.info(summary_text.replace("INFO: ", ""))
+                  st.info(summary_text.replace("INFO: ", "")) # Display as info
              else:
+                # Attempt to parse and display the formatted summary
                 try:
-                    # Parsing logic remains the same
                     sections = {}
                     current_section_key = None
                     headers_map = { # Ensure these match the AI prompt's H4 headers
@@ -460,36 +521,42 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                                  matched_header = True
                                  break
                         if matched_header: continue
+                        # Add item to current section if format matches
                         if current_section_key and line_strip.startswith('* '):
                              item_text = line_strip[2:].strip()
                              sections[current_section_key].append(item_text)
-                        elif current_section_key and line_strip and "none found" in line_strip.lower():
+                        elif current_section_key and line_strip and "none found" in line_strip.lower(): # Capture 'None found' case
                              sections[current_section_key].append(line_strip)
 
-                    st.markdown("### Categorized Summary of Content Changes:") # Updated title
+                    st.markdown("### Categorized Summary of Content Changes:") # Display title
+                    # Display each section
                     for key, display_name in header_display.items():
                         st.markdown(f'<p class="summary-header">{display_name}</p>', unsafe_allow_html=True)
                         if key in sections and sections[key]:
                             items = sections[key]
+                            # Handle 'None found' display
                             if len(items) == 1 and "none found" in items[0].lower():
                                 st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*")
                             else:
+                                # Display actual list items with styling
                                 for item in items:
-                                    # Added check for item existence before prefix check
-                                    if item and item.startswith('+'):
-                                        # Use div wrapper for better layout control
-                                        st.markdown(f"<div class='summary-item'><span class='summary-add'>{item}</span></div>", unsafe_allow_html=True)
-                                    elif item and item.startswith('-'):
-                                        st.markdown(f"<div class='summary-item'><span class='summary-del'>{item}</span></div>", unsafe_allow_html=True)
-                                    elif item: # Don't apply color if no prefix (e.g., justification text from AI)
-                                        st.markdown(f"<div class='summary-item'>{item}</div>", unsafe_allow_html=True)
+                                    item_html = item # Start with raw item text
+                                    # Basic check for +/- prefix for styling
+                                    if item.startswith('+'):
+                                        item_html = f"<span class='summary-add'>{item}</span>"
+                                    elif item.startswith('-'):
+                                        item_html = f"<span class='summary-del'>{item}</span>"
+                                    # Wrap in div for consistent indentation/layout
+                                    st.markdown(f"<div class='summary-item'>{item_html}</div>", unsafe_allow_html=True)
                         else:
-                             st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # Display None found if section is missing or truly empty
-                except Exception as e:
-                    st.error(f"Failed to parse AI summary format. Raw output:\nError: {e}")
-                    st.markdown(f"```markdown\n{summary_text}\n```") # Fallback to raw
+                             st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # If section key wasn't found or list was empty
 
-        # Explain disabled button state
+                except Exception as e:
+                    # Fallback to raw display if parsing fails
+                    st.error(f"Failed to parse AI summary format. Raw output:\nError: {e}")
+                    st.markdown(f"```markdown\n{summary_text}\n```")
+
+        # Explain disabled button state if summary hasn't been generated
         elif button_disabled and not st.session_state.get('processing_comparison'):
              if not ai_enabled: st.warning("AI Summary disabled: API Key missing/invalid.")
              # Check normalized text versions for failure
@@ -500,8 +567,8 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                  st.warning("AI Summary disabled: Click 'Compare Documents' first.")
 
 # Handle Errors / Loading State
-elif st.session_state.get('diff_html_output') and isinstance(st.session_state.get('diff_html_output'), str) and st.session_state.get('diff_html_output', "").strip().lower().startswith("<p style='color:red;'>error:"):
-    # Display error from generate_dmp_diff_html if it occurred
+# Display error from generate_dmp_diff_html if it occurred
+elif not st.session_state.get('processing_comparison') and st.session_state.get('diff_html_output') and isinstance(st.session_state.get('diff_html_output'), str) and st.session_state.get('diff_html_output', "").strip().lower().startswith("<p style='color:red;'>error:"):
      st.markdown("---") # Add separator before error
      st.error("Failed to generate visual comparison:")
      st.markdown(st.session_state.diff_html_output, unsafe_allow_html=True)
