@@ -91,17 +91,34 @@ init_session_state()
 
 # --- Gemini API Configuration ---
 ai_enabled = False
+api_key = None # Initialize api_key
 try:
     # Attempt to get API key from environment variables first, then secrets
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key and hasattr(st, 'secrets'): # Check if st.secrets exists
+    api_key_env = os.environ.get("GOOGLE_API_KEY")
+    api_key_secret = None
+
+    if hasattr(st, 'secrets'): # Check if st.secrets exists
          # Use the secrets management provided by Streamlit
          secrets = st.secrets
          if "GOOGLE_API_KEY" in secrets:
-            api_key = secrets["GOOGLE_API_KEY"]
+            api_key_secret = secrets["GOOGLE_API_KEY"]
+
+    # Prioritize secrets file if it exists, otherwise use environment variable
+    if api_key_secret:
+        api_key = api_key_secret
+        source = "Streamlit secrets"
+    elif api_key_env:
+        api_key = api_key_env
+        source = "Environment variable"
+    else:
+        source = "None found"
 
 
     if api_key:
+        # --- TEMPORARY DEBUG LINE ---
+        st.sidebar.text(f"API Key Source: {source}")
+        st.sidebar.text(f"Using Key: ...{api_key[-6:]}") # Show last 6 chars for verification
+        # --- END DEBUG LINE ---
         genai.configure(api_key=api_key)
         # --- Using 2.5 PRO MODEL ---
         model = genai.GenerativeModel('gemini-2.5-pro')
@@ -193,7 +210,6 @@ def get_ai_summary(text1, text2):
 
     # Filter for actual change lines (+ or -), ignoring file headers
     # Also ignore lines that are purely whitespace changes after the +/-
-    # --- This is the variable we should use ---
     diff_text_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++')) and line[1:].strip()]
 
     # Check if *any* non-whitespace difference was found
@@ -209,7 +225,6 @@ def get_ai_summary(text1, text2):
 
 
     # Join the *meaningful* lines for the prompt
-    # --- FIX THE TYPO HERE ---
     diff_text = "".join(diff_text_lines) # Use the correct variable name
 
     # --- REFINED PROMPT ---
@@ -292,8 +307,8 @@ def get_ai_summary(text1, text2):
         # More specific error handling if possible
         error_message = f"Error communicating with the AI model: {e}"
         # You could check for specific error types, e.g., related to quotas
-        if "quota" in str(e).lower():
-             error_message += "\nThis might be a quota issue. Please check your API key usage and limits."
+        if "quota" in str(e).lower() or "429" in str(e): # Check for quota error specifically
+             error_message += "\nThis looks like a quota issue. Please verify your API key has available quota or wait and retry."
         return error_message
 
 
