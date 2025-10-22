@@ -4,6 +4,7 @@ import fitz  # PyMuPDF
 import os
 import time
 import re
+import sys
 import unicodedata # For robust normalization
 # --- ENSURE THESE ARE IMPORTED ---
 try:
