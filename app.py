@@ -99,15 +99,8 @@ try:
 
     if api_key:
         genai.configure(api_key=api_key)
-        # Ensure the model name is correct as per Google's documentation for general text generation
-        model = genai.GenerativeModel('gemini-pro') # Reverted to standard 'gemini-pro' for stability
-        # Test basic connectivity during setup (optional but helpful for debugging)
-        # try:
-        #     model.generate_content("test", generation_config=genai.types.GenerationConfig(max_output_tokens=1))
-        #     ai_enabled = True
-        # except Exception as test_e:
-        #     st.warning(f"Connected but failed test call to Gemini model: {test_e}")
-        #     ai_enabled = False # Treat as disabled if test fails
+        # --- SWITCH BACK TO 2.5 MODEL ---
+        model = genai.GenerativeModel('gemini-2.5-pro') # Using the model you found previously
         ai_enabled = True # Assume enabled if configuration works
     else:
         st.warning("Google API Key not found in environment variables or Streamlit secrets. The AI Summary feature is disabled.")
@@ -196,7 +189,7 @@ def get_ai_summary(text1, text2):
     if not substantive_changes_found:
         return "No substantive textual differences were found after basic cleaning. Minor variations in spacing or formatting might exist but were ignored."
 
-    # --- UPDATED PROMPT ---
+    # --- UPDATED PROMPT (More robust instructions) ---
     prompt = f"""
     You are an expert clinical trial protocol reviewer. Your task is to analyze the textual differences between two versions of a document and summarize ONLY the most significant, substantive modifications.
 
