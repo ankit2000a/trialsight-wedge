@@ -6,19 +6,14 @@ import unicodedata
 from typing import List, Tuple
 import os
 
-# Try Claude first, fallback to Gemini
-try:
-    import anthropic
-    CLAUDE_AVAILABLE = True
-except ImportError:
-    CLAUDE_AVAILABLE = False
-
+# Import Gemini
 try:
     import google.generativeai as genai
     from google.generativeai.types import HarmCategory, HarmBlockThreshold
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+    st.error("⚠️ Please install: pip install google-generativeai")
 
 
 # ============= PAGE CONFIG =============
@@ -225,25 +220,60 @@ def generate_visual_diff_html(text1: str, text2: str) -> str:
 
 # ============= AI SUMMARY GENERATION =============
 
-def get_ai_summary_claude(added: List[str], deleted: List[str]) -> str:
+def get_ai_summary(added: List[str], deleted: List[str]) -> str:
     """
-    Generate summary using Claude API with research-backed prompt engineering.
-    Based on: Huang et al. (2024) npj Digital Medicine - 89% accuracy achieved
-    through iterative prompt refinement.
+    Generate summary using Gemini API with research-backed prompt engineering.
+    Based on: Huang et al. (2024) npj Digital Medicine - 89% accuracy achieved.
     """
     
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    # Check if no changes
+    if not added and not deleted:
         return """
-**⚠️ Claude API Key Not Found**
+#### Clinically Significant Changes (Added/Deleted Lines)
+None identified.
 
-Set the `ANTHROPIC_API_KEY` environment variable.
+#### Other Added Lines
+None identified.
 
-Get your key at: https://console.anthropic.com/
+#### Other Deleted Lines
+None identified.
+
+**Note:** No semantic differences detected between the documents.
+"""
+    
+    # Check if Gemini is available
+    if not GEMINI_AVAILABLE:
+        return "**⚠️ Gemini not available.** Install: `pip install google-generativeai`"
+    
+    # Get API key
+    api_key = None
+    if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    else:
+        api_key = os.environ.get("GOOGLE_API_KEY")
+    
+    if not api_key:
+        return """**⚠️ Gemini API Key Not Found**
+
+Please set your API key in one of these ways:
+
+**Option 1: Streamlit Secrets (Recommended)**
+Create `.streamlit/secrets.toml` with:
+```
+GOOGLE_API_KEY = "your-key-here"
+```
+
+**Option 2: Environment Variable**
+```bash
+export GOOGLE_API_KEY='your-key-here'
+```
+
+Get your free API key at: https://aistudio.google.com/app/apikey
 """
     
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
         
         # Prepare changes for prompt
         added_text = "\n".join([f"+ {chunk}" for chunk in added[:100]]) if added else "(none)"
@@ -255,11 +285,7 @@ Get your key at: https://console.anthropic.com/
         if len(deleted_text) > 4000:
             deleted_text = deleted_text[:4000] + "\n... (truncated)"
         
-        # Research-backed prompt with:
-        # 1. Evidence-based reasoning
-        # 2. Chain-of-thought approach
-        # 3. Specific examples
-        # 4. Structured output format
+        # Research-backed prompt with evidence-based reasoning and chain-of-thought
         prompt = f"""You are a Clinical Research Assistant analyzing changes between two versions of a clinical trial protocol document.
 
 I have extracted SEMANTIC CONTENT CHANGES (formatting noise already filtered):
@@ -312,78 +338,7 @@ Categorize these changes by clinical significance. Use EVIDENCE-BASED reasoning 
 - If evidence is ambiguous, state "Insufficient evidence to determine significance"
 - Ignore minor rewording that doesn't change meaning
 - Each bullet must be actionable for a CRC reviewing the amendment
-- Focus on SUBSTANTIVE changes that affect trial conduct or interpretation"""
-
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2500,
-            temperature=0.1,  # Low temperature for consistency
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        return message.content[0].text
-    
-    except Exception as e:
-        return f"**⚠️ Claude API Error:** {str(e)}"
-
-
-def get_ai_summary_gemini(added: List[str], deleted: List[str]) -> str:
-    """
-    Generate summary using Gemini API with research-backed prompt engineering.
-    """
-    
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        return "**⚠️ Gemini API Key Not Found** - Set `GOOGLE_API_KEY` environment variable."
-    
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        added_text = "\n".join([f"+ {chunk}" for chunk in added[:100]]) if added else "(none)"
-        deleted_text = "\n".join([f"- {chunk}" for chunk in deleted[:100]]) if deleted else "(none)"
-        
-        if len(added_text) > 4000:
-            added_text = added_text[:4000] + "\n... (truncated)"
-        if len(deleted_text) > 4000:
-            deleted_text = deleted_text[:4000] + "\n... (truncated)"
-        
-        prompt = f"""You are analyzing clinical trial protocol amendments. Use EVIDENCE-BASED reasoning.
-
-ADDED CONTENT (formatting already filtered):
-{added_text}
-
-DELETED CONTENT (formatting already filtered):
-{deleted_text}
-
-ANALYSIS APPROACH:
-1. Identify if changes affect: Inclusion/Exclusion, Dosage, Procedures, Safety, Objectives, Endpoints
-2. Ask: "Would a CRC need to modify workflow based on this?"
-3. Categorize accordingly
-
-EXAMPLE:
-+ "patients must have normal liver function" → CLINICALLY SIGNIFICANT (Inclusion change)
-+ "study aims to evaluate safety" → Other ADDED (Objective clarification)
-
-OUTPUT FORMAT (use EXACTLY this structure):
-
-#### Clinically Significant Changes (Added/Deleted Lines)
-[State WHAT changed + WHY it matters + mark ADDED (+) or DELETED (-)]
-[Write "None identified." if none]
-
-#### Other Added Lines
-[NEW content, not clinically critical. One sentence each with (+)]
-[Write "None identified." if none]
-
-#### Other Deleted Lines
-[REMOVED content, not clinically critical. One sentence each with (-)]
-[Write "None identified." if none]
-
-RULES:
-- Base conclusions ONLY on provided evidence
-- Ignore minor rewording
-- Each bullet must be actionable for CRCs
-- If evidence ambiguous, state "Insufficient evidence"
+- Focus on SUBSTANTIVE changes that affect trial conduct or interpretation
 """
 
         safety_settings = {
@@ -402,33 +357,7 @@ RULES:
         return response.text
     
     except Exception as e:
-        return f"**⚠️ Gemini Error:** {str(e)}"
-
-
-def get_ai_summary(added: List[str], deleted: List[str]) -> str:
-    """Get AI summary - tries Claude first, falls back to Gemini."""
-    
-    if not added and not deleted:
-        return """
-#### Clinically Significant Changes (Added/Deleted Lines)
-None identified.
-
-#### Other Added Lines
-None identified.
-
-#### Other Deleted Lines
-None identified.
-
-**Note:** No semantic differences detected between the documents.
-"""
-    
-    # Try Claude first (it's better at this)
-    if CLAUDE_AVAILABLE:
-        return get_ai_summary_claude(added, deleted)
-    elif GEMINI_AVAILABLE:
-        return get_ai_summary_gemini(added, deleted)
-    else:
-        return "**⚠️ No AI API available.** Install: `pip install anthropic` or `pip install google-generativeai`"
+        return f"**⚠️ Gemini API Error:** {str(e)}\n\nPlease check your API key and connection."
 
 
 # ============= STREAMLIT UI =============
@@ -598,8 +527,8 @@ else:
    - Compares at semantic level, not character level
    - **Filters 95%+ of formatting noise BEFORE AI sees it**
 
-3. **AI Categorization**
-   - Claude/Gemini analyzes ONLY real content changes
+3. **AI Categorization (Gemini)**
+   - Analyzes ONLY real content changes
    - Categorizes by clinical significance
    - Ignores remaining minor variations
 
@@ -610,19 +539,20 @@ else:
 
 ### Setup
 
-**For Claude (recommended):**
-```bash
-export ANTHROPIC_API_KEY='your-key'
+**Get your free Gemini API key:**
+1. Go to: https://aistudio.google.com/app/apikey
+2. Click "Create API Key"
+3. Add to `.streamlit/secrets.toml`:
+```toml
+GOOGLE_API_KEY = "your-key-here"
 ```
 
-**For Gemini (fallback):**
+**Or use environment variable:**
 ```bash
-export GOOGLE_API_KEY='your-key'
+export GOOGLE_API_KEY='your-key-here'
 ```
-
-TrialSight automatically uses Claude if available, falls back to Gemini.
         """)
 
 # Footer
 st.markdown("---")
-st.caption("TrialSight MVP v1.0 | Built with Streamlit + Claude/Gemini AI | Saving CRCs time and reducing errors")
+st.caption("TrialSight MVP v1.0 | Built with Streamlit + Gemini AI | Saving CRCs time and reducing errors")
