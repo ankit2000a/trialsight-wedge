@@ -67,18 +67,20 @@ except Exception as e:
 
 @st.cache_data
 def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts text with minimal cleaning, preserving line structure."""
+    """Extracts text with minimal cleaning, preserving line structure for diff."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "\n".join(page.get_text("text", sort=True) for page in doc)
+        text = "\n".join(page.get_text("text", sort=True) for page in doc) # Sort helps reading order
+        # Minimal cleaning: Fix ligatures, normalize line endings, trim lines
         text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        text = re.sub(r'[ \t]+', ' ', text)
         lines = text.splitlines()
+        # Strip whitespace from ends of lines, keep blank lines as they might be intentional paragraph breaks
         cleaned_lines = [line.strip() for line in lines]
         text = "\n".join(cleaned_lines)
-        text = re.sub(r'\n\s*\n+', '\n\n', text) # Collapse multiple blank lines
-        text = text.strip()
+        # Collapse *multiple* consecutive blank lines to *one* blank line
+        text = re.sub(r'\n(\s*\n)+', '\n\n', text)
+        text = text.strip() # Final trim for the whole block
         return text
     except Exception as e:
         st.error(f"Error reading {filename}: {e}")
@@ -87,106 +89,77 @@ def extract_text_from_bytes(file_bytes, filename="file"):
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     """Creates side-by-side HTML diff using the minimally cleaned text."""
     if text1 is None or text2 is None: return "Error: Cannot generate diff (text extraction failed)."
-    d = difflib.HtmlDiff(wrapcolumn=80, tabsize=4)
-    html = d.make_table(text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2)
-    style = f"<style>{difflib.HtmlDiff._styles}</style>"
+    # Use SequenceMatcher for potentially better handling of minor shifts
+    # d = difflib.HtmlDiff(wrapcolumn=80, tabsize=4)
+    # html = d.make_table(text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2)
+
+    # Generate HTML diff table
+    html = difflib.HtmlDiff(wrapcolumn=80, tabsize=4).make_table(
+        text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2
+    )
+
+    style = f"<style>{difflib.HtmlDiff._styles}</style>" # Use built-in styles
     custom_style = """
     <style>
     table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; }
-    .diff_header { background-color: #374151; color: #E5E7EB; padding: 0.2em 0.5em; font-weight: bold; }
+    .diff_header { background-color: #374151; color: #E5E7EB; padding: 0.2em 0.5em; font-weight: bold; position: sticky; top: 0; z-index: 10;} /* Sticky header */
     td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; }
     .diff_next { background-color: #4b5563; }
-    .diff_add { background-color: rgba(16, 185, 129, 0.1); }
-    .diff_chg { background-color: rgba(209, 163, 23, 0.1); }
-    .diff_sub { background-color: rgba(239, 68, 68, 0.1); text-decoration: line-through; }
+    /* Slightly less intense highlighting */
+    .diff_add { background-color: rgba(16, 185, 129, 0.08); } /* Very light green */
+    .diff_chg { background-color: rgba(209, 163, 23, 0.08); } /* Very light yellow */
+    .diff_sub { background-color: rgba(239, 68, 68, 0.08); text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); } /* Underline instead of strike */
     </style>
     """
     return style + custom_style + html
 
-def normalize_text_for_comparison(text):
-    """Aggressively cleans text for content comparison, ignoring formatting."""
-    if text is None: return ""
-    text = text.lower()
-    text = re.sub(r'\s+', '', text) # Remove ALL whitespace
-    # Optionally remove punctuation if it causes issues
-    # text = re.sub(r'[^\w]', '', text) # Keep only word characters
-    return text
 
 def get_ai_summary(text1, text2):
-    """Generates a categorized summary focusing on TRUE additions/deletions."""
+    """Generates a categorized summary using AI to filter noise from raw diff."""
     if not ai_enabled: return "AI Summary feature is not available."
     if text1 is None or text2 is None: return "AI Summary cannot be generated: text extraction failed."
 
     lines1 = text1.splitlines(keepends=True)
     lines2 = text2.splitlines(keepends=True)
-    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=0))
+    # Generate diff with context lines (n=3 is default, helps AI understand location)
+    diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=3))
 
-    raw_diff_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
+    # Get ONLY the lines starting with '+' or '-' for the AI prompt
+    # DO NOT filter blank lines here - let the AI handle it based on context.
+    raw_diff_lines_for_prompt = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
 
-    # --- NOISE FILTERING LOGIC ---
-    filtered_diff_lines = []
-    i = 0
-    while i < len(raw_diff_lines):
-        line = raw_diff_lines[i]
-        if line.startswith('-'):
-            # Look ahead for potential corresponding '+' lines
-            j = i + 1
-            added_lines_content = []
-            while j < len(raw_diff_lines) and raw_diff_lines[j].startswith('+'):
-                added_lines_content.append(raw_diff_lines[j][1:])
-                j += 1
+    if not raw_diff_lines_for_prompt:
+        return "No textual differences detected by the comparison algorithm." # More direct message
 
-            # Compare normalized content
-            deleted_content = normalize_text_for_comparison(line[1:])
-            added_content_combined = normalize_text_for_comparison("".join(added_lines_content))
+    # Join lines for the prompt, including potential blank lines this time
+    diff_text_for_prompt = "".join(raw_diff_lines_for_prompt)
 
-            # If content is the same (just reformatting), skip this block
-            if deleted_content == added_content_combined:
-                i = j # Skip the matched '+' lines
-                continue # Move to the next line after the block
-
-        # If it's a '-' not matched or a standalone '+', keep it (if not blank)
-        if line[1:].strip():
-            filtered_diff_lines.append(line)
-        i += 1
-    # --- END NOISE FILTERING ---
-
-
-    if not filtered_diff_lines:
-         if any(line[1:].strip() for line in raw_diff_lines): # Raw diff had non-blank lines, but filter removed them
-             return "No substantive textual differences found. Changes detected relate primarily to text reformatting or minor whitespace variations."
-         else: # Raw diff was also empty or only whitespace
-            return "No textual differences were found between the documents after cleaning."
-
-    diff_text_for_prompt = "".join(filtered_diff_lines)
-
-    # --- PROMPT (using the filtered diff) ---
+    # --- REVISED PROMPT v6: Relying on AI to filter noise ---
     prompt = f"""
-    Analyze the *meaningful* ADDED (+) and DELETED (-) lines from a comparison between two clinical trial protocol versions (reformatting changes have been excluded). Categorize these line changes into three groups.
+    You are an expert clinical trial protocol reviewer. Analyze the raw output from a line-by-line document comparison (provided below as ADDED '+' and DELETED '-' lines). Your task is to filter out formatting noise and report only the genuine additions or deletions of content, categorized into three groups.
+
+    **IMPORTANT CONTEXT:** The comparison tool often flags lines as changed (+) or (-) simply because text has been re-wrapped to fit differently, even if the words are the same. Your primary job is to IDENTIFY and IGNORE these reformatting changes.
 
     **Instructions:**
-    1.  **Clinically Significant Lines:** Identify ADDED (+) or DELETED (-) lines clearly related to:
-        * Inclusion/Exclusion criteria
-        * Dosage / Treatment schedules
-        * Procedures / Assessments
-        * Safety reporting
-        * Objectives / Endpoints
-        List these first, mentioning context/section if possible.
-    2.  **Other Added Lines:** List ALL OTHER provided ADDED (+) lines that are not blank and not in the significant category.
-    3.  **Other Deleted Lines:** List ALL OTHER provided DELETED (-) lines that are not blank and not in the significant category.
-    4.  **IGNORE:** Do NOT report blank lines or lines containing only whitespace (they are excluded from input). Do not analyze changes *within* lines.
+    1.  **Analyze Raw Diff:** Review the raw ADDED (+) and DELETED (-) lines below. Be aware that many changes might just be text reflowing across lines.
+    2.  **Identify True Content Changes:** Look for lines where actual words or phrases have been added or removed, not just moved to a different line.
+    3.  **Categorize True Changes:**
+        * **Clinically Significant Lines:** Identify true ADDED (+) or DELETED (-) lines clearly related to: Inclusion/Exclusion criteria, Dosage/Treatment, Procedures/Assessments, Safety reporting, or Objectives/Endpoints. List these first, inferring context if possible.
+        * **Other Added Lines:** List ALL OTHER true ADDED (+) lines (non-blank, not purely reformatting) that aren't clinically significant.
+        * **Other Deleted Lines:** List ALL OTHER true DELETED (-) lines (non-blank, not purely reformatting) that aren't clinically significant.
+    4.  **IGNORE Noise:** Explicitly ignore additions/deletions that appear to be solely due to text re-wrapping or minor whitespace adjustments *within* the original text blocks. Ignore blank lines entirely.
     5.  **Output Format:** Structure your response EXACTLY like this:
 
         **Clinically Significant Changes (Added/Deleted Lines):**
-        * [List ONLY significant ADDED (+) or DELETED (-) lines here. If none found, state "None found."]
+        * [List ONLY significant ADDED (+) or DELETED (-) lines representing actual content changes. If none found, state "None found after filtering formatting noise."]
 
         **Other Added Lines:**
-        * [List ALL OTHER non-blank ADDED (+) lines from the input here. If none found, state "None found."]
+        * [List ALL OTHER non-blank ADDED (+) lines representing actual content changes. If none found, state "None found after filtering formatting noise."]
 
         **Other Deleted Lines:**
-        * [List ALL OTHER non-blank DELETED (-) lines from the input here. If none found, state "None found."]
+        * [List ALL OTHER non-blank DELETED (-) lines representing actual content changes. If none found, state "None found after filtering formatting noise."]
 
-    **Detected Meaningful Added (+) and Deleted (-) Non-Blank Lines (Reformatting Excluded):**
+    **Raw Comparison Output (Contains Reformatting Noise):**
     ---
     {diff_text_for_prompt[:8000]}
     ---
@@ -195,11 +168,12 @@ def get_ai_summary(text1, text2):
     """
 
     try:
+        # Relax safety settings, low temp
         safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         generation_config = genai.types.GenerationConfig(temperature=0.1)
         response = model.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
 
-        # Robust response handling (same as before)
+        # Robust response handling
         if not response.candidates:
             block_reason = response.prompt_feedback.block_reason if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason') else "Unknown"
             return f"Error: AI response blocked. Reason: {block_reason}."
@@ -207,7 +181,6 @@ def get_ai_summary(text1, text2):
         finish_reason = candidate.finish_reason if hasattr(candidate, 'finish_reason') else "Unknown"
         if candidate.content and candidate.content.parts and candidate.content.parts[0].text:
              response_text = candidate.content.parts[0].text.strip()
-             # if finish_reason not in ['STOP', 'MAX_TOKENS']: st.warning(f"AI response finished unexpectedly ({finish_reason}).") # Optional warning
              return response_text
         else:
              return f"Error: AI model returned an empty response. Finish Reason: {finish_reason}"
@@ -219,10 +192,10 @@ def get_ai_summary(text1, text2):
 
 # --- Main App UI ---
 st.title("📄 TrialSight: Document Comparator")
-st.markdown("Compare two versions of a document to see changes and get an AI-powered summary.")
+st.markdown("Compare two versions of a document and get an AI-powered summary of meaningful changes.") # Updated subtitle
 st.markdown("---")
 
-# File Uploader & Display Logic (same as before)
+# File Uploader & Display Logic
 if not st.session_state.get('file1_data') and not st.session_state.get('file2_data'):
     uploaded_files = st.file_uploader(
         "Upload the original and revised PDF files to compare.", type="pdf", accept_multiple_files=True, key="file_uploader")
@@ -248,8 +221,9 @@ else:
             if key in st.session_state: del st.session_state[key]
         st.rerun()
 
-# --- Comparison Logic --- (same as before)
+# --- Comparison Logic ---
 if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
+    # Show Compare button only if results don't exist yet and not processing
     if not st.session_state.get('diff_html') and not st.session_state.get('processing_comparison'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
             st.session_state.processing_comparison = True
@@ -258,11 +232,13 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                  if key in st.session_state: del st.session_state[key]
             st.rerun()
 
+    # Execute comparison if flagged
     if st.session_state.get('processing_comparison'):
         with st.spinner("Reading, cleaning, and comparing documents..."):
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             if file1 and file2:
+                # Use the simplified extraction
                 text1 = extract_text_from_bytes(file1.getvalue(), file1.name)
                 text2 = extract_text_from_bytes(file2.getvalue(), file2.name)
                 if text1 is not None and text2 is not None:
@@ -270,16 +246,19 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                     st.session_state['revised_text'] = text2
                     st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name)
                 else:
+                    # Error handled in extraction, clear state
                     st.session_state['diff_html'] = None; st.session_state['summary'] = None
             else: st.error("File data missing."); st.session_state['diff_html'] = None; st.session_state['summary'] = None
-            st.session_state.processing_comparison = False
+            st.session_state.processing_comparison = False # Reset flag
+            # Rerun only if successful
             if st.session_state.get('diff_html') and "Error:" not in st.session_state.diff_html:
                  st.rerun()
 
 
-# --- Display Results Section --- (same as before)
+# --- Display Results Section ---
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and "Error:" not in st.session_state.get('diff_html', ""):
-    # --- DEBUGGER ---
+
+    # --- DEBUGGER (using simplified cleaned text) ---
     with st.expander("Show/Hide Extracted Text (For Debugging)"):
         col1, col2 = st.columns(2)
         with col1: st.subheader("Original (Cleaned)"); st.text_area("Original", st.session_state.get('original_text', ''), height=200, key="dbg_txt1")
@@ -293,11 +272,11 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
 
     # --- AI Summary ---
     st.subheader("🤖 AI-Powered Summary")
-    st.markdown("Click for a categorized summary of added/deleted lines.")
+    st.markdown("Click for a categorized summary filtering formatting noise.") # Updated text
     button_disabled = not ai_enabled or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
-    if st.button("✨ Get Categorized Line Summary", use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
+    if st.button("✨ Get Filtered Summary", use_container_width=True, disabled=button_disabled, key="gen_summary_btn"): # Updated button text
         if st.session_state.get('original_text') is not None and st.session_state.get('revised_text') is not None:
-            with st.spinner("Analyzing changes..."):
+            with st.spinner("Analyzing changes (filtering noise)..."): # Updated spinner text
                 summary = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
                 st.session_state['summary'] = summary
                 st.rerun()
@@ -305,21 +284,21 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
 
     # Display Summary
     if st.session_state.get('summary'):
-         st.markdown("### Categorized Summary of Added/Deleted Lines:")
+         st.markdown("### Categorized Summary (Noise Filtered):") # Updated title
          summary_text = st.session_state.summary
          if summary_text.startswith("Error:") or "cannot be generated" in summary_text or "not available" in summary_text:
              st.error(summary_text)
          elif "No textual differences" in summary_text or "No substantive" in summary_text:
               st.info(summary_text)
          else:
-             st.markdown(f"```markdown\n{summary_text}\n```")
+             st.markdown(f"```markdown\n{summary_text}\n```") # Use markdown code block
 
     elif button_disabled and not st.session_state.get('processing_comparison'):
          if not ai_enabled: st.warning("AI Summary disabled: API Key missing.")
          elif st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None:
              st.warning("AI Summary disabled: Text extraction failed.")
 
-# Handle Errors / Loading State (same as before)
+# Handle Errors / Loading State
 elif st.session_state.get('diff_html') and "Error:" in st.session_state.get('diff_html', ""):
     st.error(st.session_state.diff_html)
 elif st.session_state.get('processing_comparison'):
