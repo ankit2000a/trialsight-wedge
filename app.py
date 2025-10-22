@@ -39,33 +39,46 @@ st.markdown("""
 
 # --- Session State Initialization ---
 def init_session_state():
-    for key in ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text', 'revised_text']:
-        if key not in st.session_state: st.session_state[key] = None
-    if 'processing_comparison' not in st.session_state: st.session_state.processing_comparison = False
+    # Ensure all keys exist
+    keys = ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text', 'revised_text', 'processing_comparison']
+    for key in keys:
+        if key not in st.session_state:
+            st.session_state[key] = None
+    # Ensure processing_comparison is False initially
+    if st.session_state.processing_comparison is None:
+         st.session_state.processing_comparison = False
+
 init_session_state()
 
 # --- Gemini API Configuration ---
 ai_enabled = False
 api_key = None
 try:
-    api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') else None
-    api_key_env = os.environ.get("GOOGLE_API_KEY")
+    # Use secrets.toml as the primary method
+    api_key_secret = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets else None
+    api_key_env = os.environ.get("GOOGLE_API_KEY") # Fallback to environment variable
+
     api_key = api_key_secret or api_key_env
 
     if api_key:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-pro')
+        # Check if model object needs to be created, avoid recreating if possible
+        if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
+             st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+        model = st.session_state.gemini_model
         ai_enabled = True
     else:
-        st.warning("Google API Key not found. AI Summary disabled.")
+        st.warning("Google API Key not found in Streamlit secrets or environment variables. AI Summary disabled.")
         ai_enabled = False
 except Exception as e:
     ai_enabled = False
     st.warning(f"Could not initialize Google AI: {e}")
+    if 'gemini_model' in st.session_state: st.session_state.gemini_model = None # Reset model on error
+
 
 # --- Helper Functions ---
 
-@st.cache_data
+@st.cache_data # Keep caching text extraction as it's expensive
 def extract_text_from_bytes(file_bytes, filename="file"):
     """Extracts text with minimal cleaning, preserving line structure for diff."""
     try:
@@ -73,23 +86,22 @@ def extract_text_from_bytes(file_bytes, filename="file"):
         text = "\n".join(page.get_text("text", sort=True) for page in doc)
         text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # Keep internal spaces, just normalize multiple spaces to one
-        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'[ \t]+', ' ', text) # Normalize spaces within lines
         lines = text.splitlines()
-        # Strip only leading/trailing whitespace from lines, preserve internal structure
-        cleaned_lines = [line.strip() for line in lines]
+        cleaned_lines = [line.strip() for line in lines] # Strip ends of lines
         text = "\n".join(cleaned_lines)
-        # Collapse multiple blank lines to one, important for visual diff
-        text = re.sub(r'\n(\s*\n)+', '\n\n', text)
+        text = re.sub(r'\n(\s*\n)+', '\n\n', text) # Collapse multiple blank lines to one
         text = text.strip()
         return text
     except Exception as e:
-        st.error(f"Error reading {filename}: {e}")
-        return None
+        # Don't use st.error inside cache_data function, return error indicator
+        print(f"Error reading {filename}: {e}") # Log error to console
+        return f"ERROR: Could not read {filename}" # Return error string
 
 def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
     """Creates side-by-side HTML diff."""
-    if text1 is None or text2 is None: return "Error: Cannot generate diff (text extraction failed)."
+    if text1 is None or text2 is None or text1.startswith("ERROR:") or text2.startswith("ERROR:"):
+         return "Error: Cannot generate diff (text extraction failed)."
     html = difflib.HtmlDiff(wrapcolumn=80, tabsize=4).make_table(
         text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2
     )
@@ -109,78 +121,76 @@ def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
 
 def normalize_text_for_noise_check(text):
     """Aggressively cleans text JUST for checking if content is identical despite formatting."""
-    text = text.lower() # Ignore case
-    text = re.sub(r'\s+', '', text) # Remove ALL whitespace (spaces, newlines, tabs)
-    # Optional: Remove punctuation if needed, but whitespace is usually the main issue
-    # text = re.sub(r'[^\w]', '', text) # Keep only letters/numbers
+    if not isinstance(text, str): return "" # Handle None or other types
+    text = text.lower()
+    text = re.sub(r'\s+', '', text) # Remove ALL whitespace
     return text
 
 def filter_reformatting_noise(diff_lines):
-    """
-    Filters a list of difflib output lines (+/-) to remove blocks
-    that only represent text reformatting/rewrapping.
-    """
+    """Filters difflib output (+/- lines) to remove reformatting noise."""
     filtered = []
     i = 0
     n = len(diff_lines)
     while i < n:
         line = diff_lines[i]
-        # Skip non-diff lines or already processed lines
+        # Skip non-change lines
         if not line.startswith(('-', '+')):
             i += 1
             continue
 
-        # Find the end of the current block of +/- lines
+        # Find end of current +/- block
         block_end = i
         while block_end + 1 < n and diff_lines[block_end + 1].startswith(('-', '+')):
             block_end += 1
 
-        # Extract deleted and added lines from this block
+        # Extract content from block
         deleted_block = [l[1:] for l in diff_lines[i : block_end + 1] if l.startswith('-')]
         added_block = [l[1:] for l in diff_lines[i : block_end + 1] if l.startswith('+')]
 
-        # Combine content and normalize for comparison
-        deleted_content = normalize_text_for_noise_check("".join(deleted_block))
-        added_content = normalize_text_for_noise_check("".join(added_block))
+        # Compare normalized content
+        deleted_content = normalize_text_for_noise_check(" ".join(deleted_block)) # Join with space before normalize
+        added_content = normalize_text_for_noise_check(" ".join(added_block)) # Join with space
 
-        # If normalized content is DIFFERENT, keep the original lines from this block
+        # If normalized content is DIFFERENT, keep the *original* lines (if they aren't blank)
         if deleted_content != added_content:
             for k in range(i, block_end + 1):
-                # Only add non-blank lines to the final list for the AI
-                if diff_lines[k][1:].strip():
+                if diff_lines[k][1:].strip(): # Check if line has actual content
                     filtered.append(diff_lines[k])
 
         # Move index past the processed block
         i = block_end + 1
-
     return filtered
 
 
 def get_ai_summary(text1, text2):
     """Generates a categorized summary using AI after robust noise filtering."""
-    if not ai_enabled: return "AI Summary feature is not available."
-    if text1 is None or text2 is None: return "AI Summary cannot be generated: text extraction failed."
+    # --- Input Validation ---
+    if not ai_enabled: return "AI Summary feature is not available (API key issue)."
+    # Check if text extraction failed earlier
+    if text1 is None or text2 is None or isinstance(text1, str) and text1.startswith("ERROR:") or isinstance(text2, str) and text2.startswith("ERROR:"):
+        return "AI Summary cannot be generated: text extraction failed."
 
+    # --- Diff Generation ---
     lines1 = text1.splitlines(keepends=True)
     lines2 = text2.splitlines(keepends=True)
-    # Generate diff *without* context (n=0) to simplify block detection
+    # n=0 ensures only diff lines, simplifies noise filtering logic
     diff = list(difflib.unified_diff(lines1, lines2, fromfile='Original', tofile='Revised', n=0))
 
-    # Get only the raw +/- lines
+    # --- Noise Filtering ---
     raw_diff_lines = [line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))]
-
-    # --- Apply the robust noise filtering ---
     filtered_diff_lines = filter_reformatting_noise(raw_diff_lines)
 
+    # --- Handle No Differences Case ---
     if not filtered_diff_lines:
-         if any(line[1:].strip() for line in raw_diff_lines): # Raw diff had non-blank lines, filter removed them
-             return "No substantive textual differences found. Changes detected relate primarily to text reformatting or minor whitespace variations."
-         else: # Raw diff was also empty or only whitespace
-            return "No textual differences were found between the documents after cleaning."
+         if any(line[1:].strip() for line in raw_diff_lines):
+             return "INFO: No substantive textual differences found. Changes detected relate primarily to text reformatting or minor whitespace variations."
+         else:
+            return "INFO: No textual differences were found between the documents after cleaning."
 
     diff_text_for_prompt = "".join(filtered_diff_lines)
 
-    # --- PROMPT v7 (Using pre-filtered diff) ---
+    # --- Prepare AI Call ---
+    # Prompt remains the same (v7)
     prompt = f"""
     Analyze the provided ADDED (+) and DELETED (-) lines, which represent meaningful content changes between two clinical trial protocol versions (reformatting noise has been pre-filtered). Categorize these changes.
 
@@ -215,26 +225,45 @@ def get_ai_summary(text1, text2):
     """
 
     try:
+        # Safety settings and generation config remain the same
         safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         generation_config = genai.types.GenerationConfig(temperature=0.1)
+
+        # Make the API call
+        if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
+             return "ERROR: Gemini model not initialized." # Safety check
+        model = st.session_state.gemini_model
         response = model.generate_content(prompt, generation_config=generation_config, safety_settings=safety_settings)
 
-        # Robust response handling (same as before)
+        # --- Process Response ---
         if not response.candidates:
-            block_reason = response.prompt_feedback.block_reason if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason') else "Unknown"
-            return f"Error: AI response blocked. Reason: {block_reason}."
+            block_reason = "Unknown"
+            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
+                 block_reason = response.prompt_feedback.block_reason
+            return f"ERROR: AI response blocked. Reason: {block_reason}."
+
         candidate = response.candidates[0]
         finish_reason = candidate.finish_reason if hasattr(candidate, 'finish_reason') else "Unknown"
+
         if candidate.content and candidate.content.parts and candidate.content.parts[0].text:
              response_text = candidate.content.parts[0].text.strip()
+             # Optional: Add warning for non-STOP finish reasons
+             # if finish_reason not in ['STOP', 'MAX_TOKENS']:
+             #     st.warning(f"AI response finished unexpectedly ({finish_reason}). May be incomplete.")
              return response_text
         else:
-             return f"Error: AI model returned an empty response. Finish Reason: {finish_reason}"
+             # If text is empty, provide finish reason for debugging
+             return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}"
+
     except Exception as e:
-        error_message = f"Error communicating with the AI model: {e}"
+        # Catch-all for API communication errors, including quota errors
+        error_message = f"ERROR: Failed to get AI summary: {e}"
+        # Check specific error details if available
         if "quota" in str(e).lower() or "429" in str(e):
-             error_message += "\nQuota issue likely. Check API key/limits or wait."
-        return error_message
+             error_message += "\n(Quota exceeded - please wait a minute or check API key limits)"
+        st.error(error_message) # Show error in UI immediately
+        return "Summary generation failed due to an API error." # Return generic error for state
+
 
 # --- Main App UI ---
 st.title("📄 TrialSight: Document Comparator")
@@ -250,12 +279,14 @@ if not st.session_state.get('file1_data') and not st.session_state.get('file2_da
         else:
             st.session_state.file1_data = uploaded_files[0]
             st.session_state.file2_data = uploaded_files[1]
+            # Clear results immediately on new upload
             keys_to_clear = ['diff_html', 'summary', 'original_text', 'revised_text']
             for key in keys_to_clear:
                 if key in st.session_state: del st.session_state[key]
-            st.session_state.processing_comparison = False
+            st.session_state.processing_comparison = False # Ensure reset
             st.rerun()
 else:
+    # Display file names and clear button
     col1, col2 = st.columns(2)
     file1_name = st.session_state.file1_data.name if st.session_state.get('file1_data') else "N/A"
     file2_name = st.session_state.file2_data.name if st.session_state.get('file2_data') else "N/A"
@@ -268,42 +299,62 @@ else:
         st.rerun()
 
 # --- Comparison Logic ---
+# Show Compare button OR run comparison if needed
 if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
+    # If results don't exist yet and not currently processing, show button
     if not st.session_state.get('diff_html') and not st.session_state.get('processing_comparison'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
-            st.session_state.processing_comparison = True
+            st.session_state.processing_comparison = True # Set flag to start processing
+            # Clear results before starting
             keys_to_clear = ['diff_html', 'summary', 'original_text', 'revised_text']
             for key in keys_to_clear:
-                 if key in st.session_state: del st.session_state[key]
-            st.rerun()
+                if key in st.session_state: del st.session_state[key]
+            st.rerun() # Rerun to show spinner
 
+    # Execute comparison if processing flag is set
     if st.session_state.get('processing_comparison'):
         with st.spinner("Reading, cleaning, and comparing documents..."):
+            time.sleep(0.5) # Small delay to ensure spinner appears
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             if file1 and file2:
+                # Extract text (error handling inside function)
                 text1 = extract_text_from_bytes(file1.getvalue(), file1.name)
                 text2 = extract_text_from_bytes(file2.getvalue(), file2.name)
-                if text1 is not None and text2 is not None:
-                    st.session_state['original_text'] = text1
-                    st.session_state['revised_text'] = text2
+
+                # Store extracted text regardless of success for debugging
+                st.session_state['original_text'] = text1
+                st.session_state['revised_text'] = text2
+
+                # Generate diff only if extraction didn't return error strings
+                if isinstance(text1, str) and not text1.startswith("ERROR:") and \
+                   isinstance(text2, str) and not text2.startswith("ERROR:"):
                     st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name)
                 else:
-                    st.session_state['diff_html'] = None; st.session_state['summary'] = None # Error handled in extract
-            else: st.error("File data missing."); st.session_state['diff_html'] = None; st.session_state['summary'] = None
-            st.session_state.processing_comparison = False # Reset flag
-            if st.session_state.get('diff_html') and "Error:" not in st.session_state.diff_html:
-                 st.rerun() # Rerun to show results
+                    st.session_state['diff_html'] = "Error: Text extraction failed, cannot generate comparison."
+                    st.session_state['summary'] = None # Clear summary if diff fails
+
+            else:
+                 st.session_state['diff_html'] = "Error: File data missing."
+                 st.session_state['summary'] = None
+
+            st.session_state.processing_comparison = False # Reset flag after processing
+            # Rerun to display results or error message from diff_html
+            st.rerun()
 
 
 # --- Display Results Section ---
-if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and "Error:" not in st.session_state.get('diff_html', ""):
+# Check if comparison is done and diff_html exists and is not an error message
+if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and not st.session_state.get('diff_html', "").startswith("Error:"):
 
     # --- DEBUGGER ---
     with st.expander("Show/Hide Extracted Text (For Debugging)"):
         col1, col2 = st.columns(2)
-        with col1: st.subheader("Original (Cleaned)"); st.text_area("Original", st.session_state.get('original_text', ''), height=200, key="dbg_txt1")
-        with col2: st.subheader("Revised (Cleaned)"); st.text_area("Revised", st.session_state.get('revised_text', ''), height=200, key="dbg_txt2")
+        # Display text, handle None or Error strings gracefully
+        original_display = st.session_state.get('original_text') if isinstance(st.session_state.get('original_text'), str) else "Extraction Error or Not Run"
+        revised_display = st.session_state.get('revised_text') if isinstance(st.session_state.get('revised_text'), str) else "Extraction Error or Not Run"
+        with col1: st.subheader("Original (Cleaned)"); st.text_area("Original", original_display, height=200, key="dbg_txt1")
+        with col2: st.subheader("Revised (Cleaned)"); st.text_area("Revised", revised_display, height=200, key="dbg_txt2")
 
     # --- Side-by-Side Diff ---
     with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
@@ -314,34 +365,61 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
     # --- AI Summary ---
     st.subheader("🤖 AI-Powered Summary")
     st.markdown("Click for a categorized summary filtering formatting noise.")
-    button_disabled = not ai_enabled or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
-    if st.button("✨ Get Filtered Summary", use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
-        if st.session_state.get('original_text') is not None and st.session_state.get('revised_text') is not None:
-            with st.spinner("Analyzing changes (filtering noise)..."):
-                summary = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
-                st.session_state['summary'] = summary
-                st.rerun()
-        else: st.error("Cannot generate summary: Cleaned text missing.")
 
-    # Display Summary
-    if st.session_state.get('summary'):
+    # Disable button if AI disabled OR if text extraction failed (check original_text state)
+    button_disabled = not ai_enabled or isinstance(st.session_state.get('original_text'), str) and st.session_state.get('original_text', "").startswith("ERROR:") \
+                      or isinstance(st.session_state.get('revised_text'), str) and st.session_state.get('revised_text', "").startswith("ERROR:") \
+                      or st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None
+
+
+    # --- MODIFICATION: Generate summary only if button clicked AND summary doesn't exist yet ---
+    if st.button("✨ Get Filtered Summary", use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
+        # Check if summary already exists to prevent re-calls
+        if st.session_state.get('summary') is None:
+            if st.session_state.get('original_text') is not None and st.session_state.get('revised_text') is not None:
+                with st.spinner("Analyzing changes (filtering noise)..."):
+                    # Call AI summary function
+                    summary_result = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
+                    st.session_state['summary'] = summary_result # Store result (could be error string)
+                    st.rerun() # Rerun to display the generated summary or error
+            else:
+                 # This case should ideally be caught by button_disabled, but double-check
+                 st.error("Cannot generate summary: Cleaned text missing.")
+        # else: # If summary already exists, do nothing on button click to avoid re-call
+             # st.info("Summary already generated for this comparison.") # Optional message
+
+
+    # Display Summary (if it exists)
+    if st.session_state.get('summary') is not None: # Check if summary exists (could be None, INFO, ERROR, or actual summary)
          st.markdown("### Categorized Summary (Noise Filtered):")
          summary_text = st.session_state.summary
-         if summary_text.startswith("Error:") or "cannot be generated" in summary_text or "not available" in summary_text:
+         # Use specific prefixes/keywords to determine message type
+         if summary_text.startswith("ERROR:") or "cannot be generated" in summary_text or "not available" in summary_text:
              st.error(summary_text)
-         elif "No textual differences" in summary_text or "No substantive" in summary_text:
-              st.info(summary_text)
+         elif summary_text.startswith("INFO:") or "No textual differences" in summary_text or "No substantive" in summary_text:
+              # Remove INFO prefix if present for cleaner display
+              display_info = summary_text.replace("INFO: ", "")
+              st.info(display_info)
          else:
+             # Display the actual summary in a code block
              st.markdown(f"```markdown\n{summary_text}\n```")
 
+    # Explain disabled button state if summary hasn't been generated yet
     elif button_disabled and not st.session_state.get('processing_comparison'):
-         if not ai_enabled: st.warning("AI Summary disabled: API Key missing.")
-         elif st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None:
+         if not ai_enabled: st.warning("AI Summary disabled: API Key missing or invalid.")
+         elif isinstance(st.session_state.get('original_text'), str) and st.session_state.get('original_text', "").startswith("ERROR:") or \
+              isinstance(st.session_state.get('revised_text'), str) and st.session_state.get('revised_text', "").startswith("ERROR:"):
              st.warning("AI Summary disabled: Text extraction failed.")
+         elif st.session_state.get('original_text') is None or st.session_state.get('revised_text') is None:
+             # This might occur if Compare Documents hasn't been run yet
+             st.warning("AI Summary disabled: Please click 'Compare Documents' first.")
+
 
 # Handle Errors / Loading State
-elif st.session_state.get('diff_html') and "Error:" in st.session_state.get('diff_html', ""):
+elif st.session_state.get('diff_html') and isinstance(st.session_state.get('diff_html'), str) and st.session_state.get('diff_html', "").startswith("Error:"):
+    # Display error from generate_diff_html if it occurred
     st.error(st.session_state.diff_html)
 elif st.session_state.get('processing_comparison'):
+     # Show spinner if the processing flag is set
      st.markdown('<div class="loader-container"><div class="loader"></div><p>Processing...</p></div>', unsafe_allow_html=True)
 
