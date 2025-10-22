@@ -4,7 +4,7 @@ import difflib
 import google.generativeai as genai
 import os
 import time
-import re
+import re  # Still need re for basic cleaning
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -80,14 +80,12 @@ st.markdown("""
 
 # --- Session State Initialization ---
 def init_session_state():
-    # Adding keys for the different text versions
-    for key in ['files', 'diff_html', 'summary', 
-                'original_text_display', 'revised_text_display', 
-                'original_text_ai', 'revised_text_ai']:
+    # Reverted to simpler state keys
+    for key in ['files', 'diff_html', 'summary', 'original_text', 'revised_text']:
         if key not in st.session_state:
             st.session_state[key] = None
-    if 'processing' not in st.session_state:
-        st.session_state.processing = False
+    if 'processing' not in st.session_state: # Renamed processing flag slightly
+        st.session_state.processing_comparison = False # Use this flag
 
 init_session_state()
 
@@ -114,140 +112,97 @@ except Exception as e:
 
 @st.cache_data
 def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts and CLEANS text from PDF bytes, returning two versions."""
+    """Extracts and CLEANS text from PDF bytes."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
+        # --- FIX: Join pages with newlines, not spaces ---
+        text = "\n".join(page.get_text() for page in doc)
         
-        # --- Version 1: For Display (keeps line breaks) ---
-        text_display = "\n".join(page.get_text() for page in doc)
-        # Fix ligatures
-        text_display = re.sub(r'ﬁ', 'fi', text_display)
-        text_display = re.sub(r'ﬂ', 'fl', text_display)
-        # Clean up extra spaces on each line but keep line structure
-        lines_display = text_display.splitlines()
-        cleaned_lines_display = [" ".join(line.split()) for line in lines_display] # Handles multiple spaces between words
-        text_display = "\n".join(cleaned_lines_display).strip()
-
-        # --- Version 2: For AI Comparison (aggressive cleaning, ignores line breaks) ---
-        text_ai = text_display # Start with the display version
-        text_ai = text_ai.lower() # Convert to lowercase
-        text_ai = re.sub(r'([:.,;()])', r' \1 ', text_ai) # Add space around punctuation
-        text_ai = re.sub(r'\s+', ' ', text_ai) # Collapse ALL whitespace (incl. newlines) to single space
-        text_ai = text_ai.strip()
-
-        return text_display, text_ai
+        # --- Basic Cleaning Steps ---
+        # Fix common PDF ligature issues (like 'fi' -> 'fl')
+        text = re.sub(r'ﬁ', 'fi', text)
+        text = re.sub(r'ﬂ', 'fl', text)
         
+        # Replace tabs and multiple spaces with a single space (keep newlines)
+        text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+        
+        # Optional: Collapse multiple blank lines into one
+        text = re.sub(r'\n\s*\n', '\n', text)
+        
+        # Remove leading/trailing whitespace
+        text = text.strip()
+        # --- END Basic Cleaning Steps ---
+        
+        return text
     except Exception as e:
+        # Provide more context in the error message
         st.error(f"Error reading {filename}: {e}")
-        return None, None # Return None if reading fails
+        return None # Return None on error
 
-def generate_diff_html(text1_display, text2_display, filename1="Original", filename2="Revised"):
-    """Creates a side-by-side HTML diff using the display text."""
-    # Only compare if text is not None
-    if text1_display is None or text2_display is None:
-        return "Error: Could not generate diff due to text extraction issues."
+def generate_diff_html(text1, text2, filename1="Original", filename2="Revised"):
+    """Creates a side-by-side HTML diff of two texts."""
+     # Check if text extraction failed
+    if text1 is None or text2 is None:
+        return "Error: Cannot generate diff because text extraction failed for one or both files."
         
     d = difflib.HtmlDiff(wrapcolumn=80)
-    # Use the display text (with line breaks) for the HTML table
-    html = d.make_table(text1_display.splitlines(), text2_display.splitlines(), fromdesc=filename1, todesc=filename2)
+    # This now gets a proper list of lines
+    html = d.make_table(text1.splitlines(), text2.splitlines(), fromdesc=filename1, todesc=filename2)
     style = """
     <style>
     table.diff { font-family: monospace; border-collapse: collapse; width: 100%; }
     .diff_header { background-color: #374151; color: #E5E7EB; }
-    .diff_add { background-color: #052e16; } /* Green for additions */
-    .diff_chg { background-color: #4d380c; } /* Yellow for changes */
-    .diff_sub { background-color: #4c1d1d; } /* Red for deletions */
+    .diff_add { background-color: #052e16; }
+    .diff_chg { background-color: #4d380c; }
+    .diff_sub { background-color: #4c1d1d; }
     </style>
     """
     return style + html
 
-def get_ai_summary(text1_ai, text2_ai):
-    """Generates a summary of changes using the cleaned AI text."""
+def get_ai_summary(text1, text2):
+    """Generates a summary of changes using the Gemini API."""
     if not ai_enabled:
         return "AI Summary feature is not available."
-    
-    # Only compare if text is not None
-    if text1_ai is None or text2_ai is None:
-        return "AI Summary cannot be generated due to text extraction issues."
+        
+     # Check if text extraction failed before diffing
+    if text1 is None or text2 is None:
+        return "AI Summary cannot be generated because text extraction failed."
 
-    # --- Use the aggressively cleaned text (text_ai) for diffing ---
     diff = list(difflib.unified_diff(
-        text1_ai.splitlines(keepends=True), # Split even if it's one line
-        text2_ai.splitlines(keepends=True), # Split even if it's one line
-        fromfile='Original_AI',
-        tofile='Revised_AI',
+        text1.splitlines(keepends=True),
+        text2.splitlines(keepends=True),
+        fromfile='Original',
+        tofile='Revised',
     ))
     diff_text = "".join([line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))])
 
-    # Check if the *only* differences are whitespace changes ignored by the AI version
-    diff_display_only = list(difflib.unified_diff(
-        st.session_state.original_text_display.splitlines(keepends=True),
-        st.session_state.revised_text_display.splitlines(keepends=True),
-         fromfile='Original_Display',
-        tofile='Revised_Display',
-    ))
-    diff_display_text = "".join([line for line in diff_display_only if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))])
-
-
     if not diff_text.strip():
-        if diff_display_text.strip(): # Differences exist in display but not AI version
-             return ("No substantive textual differences were found after cleaning and normalization. "
-                     "Minor differences in formatting, line breaks, or spacing were detected but ignored.")
-        else: # No differences found at all
-            return "No textual differences were found between the documents."
+        # --- UPDATED MESSAGE ---
+        return "No substantive textual differences were found after basic cleaning."
 
-
-    # --- MODIFIED PROMPT ---
     prompt = f"""
-    You are an expert clinical trial protocol reviewer. Analyze the following changes between two versions of a document (differences in formatting, case, and extra whitespace have been minimized) and generate a concise, bulleted list of the most significant modifications.
+    You are an expert clinical trial protocol reviewer. Analyze the following changes between two versions of a document and generate a concise, bulleted list of the most significant modifications.
     Focus specifically on substantive changes related to:
     1.  Inclusion/Exclusion criteria
     2.  Dosage information or treatment schedules
     3.  Study procedures or assessments
     4.  Safety reporting requirements
     5.  Key objectives or endpoints
+    Ignore minor grammatical corrections, formatting changes (like line breaks or minor spacing), or rephrasing unless it alters the meaning. Structure your output clearly using markdown.
 
-    Ignore minor grammatical corrections or rephrasing unless it alters the clinical meaning.
-    If you find significant changes, list them.
-    If the changes you found seem minor or non-substantive AFTER ignoring formatting/whitespace, explicitly state that.
-
-    Here are the extracted textual changes (lines starting with '+' were added, lines with '-' were removed):
+    Here are the extracted changes (lines starting with '+' were added, lines with '-' were removed):
     ---
-    {diff_text[:8000]} 
+    {diff_text[:8000]}
     ---
     **Summary of Key Changes:**
     """
     
     try:
-        # Add retry logic with backoff
-        max_retries = 3
-        delay = 1
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                # Check if response has text, otherwise retry might be needed
-                if response.text:
-                   return response.text
-                else:
-                    # Handle cases where the API returns an empty response unexpectedly
-                    if attempt == max_retries - 1:
-                       return "Error: AI model returned an empty response."
-                    # print(f"Empty response received, retrying in {delay}s...") # Console logging removed
-            except Exception as e:
-                # Handle potential API errors (like rate limiting)
-                if attempt == max_retries - 1:
-                    return f"Error communicating with the AI model after multiple retries: {e}"
-                # print(f"API Error: {e}. Retrying in {delay}s...") # Console logging removed
-            
-            time.sleep(delay)
-            delay *= 2 # Exponential backoff
-        
-        return "Error: AI model failed to generate summary after multiple retries." # Fallback message
-
+        # Basic API call, removed retry logic for simplicity as requested by reverting
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        # General catch-all for unexpected errors during the process
-        return f"An unexpected error occurred while generating the AI summary: {e}"
-
+        return f"Error communicating with the AI model: {e}"
 
 # --- Main App UI ---
 st.title("📄 TrialSight: Document Comparator")
@@ -266,14 +221,14 @@ if not st.session_state.get('file1_data') and not st.session_state.get('file2_da
         if len(uploaded_files) != 2:
             st.warning("Please upload exactly two files.")
         else:
-            # Store uploaded files
             st.session_state.file1_data = uploaded_files[0]
             st.session_state.file2_data = uploaded_files[1]
-            # --- AUTO-TRIGGER COMPARISON ---
-            st.session_state.processing_comparison = True # Set flag to trigger comparison logic
+            # Clear previous results when new files are uploaded
             st.session_state.diff_html = None
             st.session_state.summary = None
-            st.rerun() # Rerun to execute the comparison logic immediately
+            st.session_state.original_text = None
+            st.session_state.revised_text = None
+            st.rerun()
 else:
     col1, col2 = st.columns(2)
     with col1:
@@ -282,72 +237,68 @@ else:
         st.success(f"Revised: **{st.session_state.file2_data.name}**")
 
     if st.button("Clear Files and Start Over"):
-        # Clear all relevant session state keys
+        # Clear specific keys, not all session state
         keys_to_clear = ['file1_data', 'file2_data', 'diff_html', 'summary', 
-                         'original_text_display', 'revised_text_display', 
-                         'original_text_ai', 'revised_text_ai', 'processing_comparison']
+                         'original_text', 'revised_text', 'processing_comparison']
         for key in keys_to_clear:
-            if key in st.session_state:
+             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
 
 # --- Main Logic ---
-# --- MOVED: Triggered automatically after file upload or if files exist ---
-if st.session_state.get('file1_data') and st.session_state.get('file2_data') and st.session_state.processing_comparison:
-    # Check if text has already been processed in this run to prevent infinite loop
-    if 'original_text_display' not in st.session_state or st.session_state.original_text_display is None:
-        
-        with st.spinner("Reading, cleaning, and comparing documents..."):
+# Trigger comparison only when the button is clicked and files are present
+if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
+    # Only show compare button if results aren't already displayed
+    if not st.session_state.get('diff_html'): 
+        if st.button("Compare Documents", type="primary", use_container_width=True):
+            st.session_state.processing_comparison = True # Set flag
+            # Clear previous results before processing
+            st.session_state.diff_html = None
+            st.session_state.summary = None
+            st.session_state.original_text = None
+            st.session_state.revised_text = None
+            st.rerun() # Rerun to show spinner and process
+
+    # --- Processing logic runs if flag is set ---
+    if st.session_state.get('processing_comparison', False):
+         with st.spinner("Reading, cleaning, and comparing documents..."):
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             
             file1_bytes = file1.getvalue()
             file2_bytes = file2.getvalue()
             
-            # Extract both versions of text
-            text1_display, text1_ai = extract_text_from_bytes(file1_bytes, file1.name)
-            text2_display, text2_ai = extract_text_from_bytes(file2_bytes, file2.name)
+            # Extract single version of text
+            text1 = extract_text_from_bytes(file1_bytes, file1.name)
+            text2 = extract_text_from_bytes(file2_bytes, file2.name)
             
-            # Store both versions in session state
-            st.session_state['original_text_display'] = text1_display
-            st.session_state['revised_text_display'] = text2_display
-            st.session_state['original_text_ai'] = text1_ai
-            st.session_state['revised_text_ai'] = text2_ai
-
-            # Proceed only if text extraction was successful
-            if text1_display is not None and text2_display is not None:
-                # Generate HTML diff using display text
-                st.session_state['diff_html'] = generate_diff_html(text1_display, text2_display, file1.name, file2.name)
-                
-                # --- AUTO-GENERATE SUMMARY ---
-                with st.spinner("Analyzing changes with Gemini AI..."):
-                     st.session_state['summary'] = get_ai_summary(text1_ai, text2_ai) # Use AI text
-
+            # Store text in session state only if extraction was successful
+            if text1 is not None and text2 is not None:
+                st.session_state['original_text'] = text1
+                st.session_state['revised_text'] = text2
+                st.session_state['diff_html'] = generate_diff_html(text1, text2, file1.name, file2.name)
             else:
-                st.error("Failed to process one or both PDF files. Cannot compare or summarize.")
-                st.session_state['diff_html'] = None # Ensure diff is cleared on error
-                st.session_state['summary'] = None # Ensure summary is cleared on error
-            
-            st.session_state.processing_comparison = False # Reset flag
-            st.rerun() # Rerun to update the display now that processing is done
+                # Error is handled in extract_text_from_bytes, ensure state is clean
+                st.session_state['diff_html'] = None
+                st.session_state['summary'] = None
+
+            st.session_state.processing_comparison = False # Reset flag after processing
+            st.rerun() # Rerun to display results
 
 # --- Display Results Section ---
 # Display results only if processing is complete and diff_html exists
 if not st.session_state.get('processing_comparison', False) and st.session_state.get('diff_html'):
     
-    # --- DEBUGGER ---
+    # --- DEBUGGER (using the single text version) ---
     with st.expander("Show/Hide Extracted Text (For Debugging)"):
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Text for Display (Original)")
-            st.text_area("Display Text 1", st.session_state.original_text_display, height=150, key="debug_text1_display")
-            st.subheader("Text for AI (Original)")
-            st.text_area("AI Text 1", st.session_state.original_text_ai, height=150, key="debug_text1_ai")
+            st.subheader("Text from Original")
+            # Ensure text exists before displaying
+            st.text_area("Original Text", st.session_state.get('original_text', 'N/A'), height=200, key="debug_text1") 
         with col2:
-            st.subheader("Text for Display (Revised)")
-            st.text_area("Display Text 2", st.session_state.revised_text_display, height=150, key="debug_text2_display")
-            st.subheader("Text for AI (Revised)")
-            st.text_area("AI Text 2", st.session_state.revised_text_ai, height=150, key="debug_text2_ai")
+            st.subheader("Text from Revised")
+            st.text_area("Revised Text", st.session_state.get('revised_text', 'N/A'), height=200, key="debug_text2")
             
     # --- Side-by-Side Diff ---
     with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
@@ -355,17 +306,29 @@ if not st.session_state.get('processing_comparison', False) and st.session_state
 
     st.markdown("---")
     
-    # --- AI Summary (Now shown automatically) ---
+    # --- AI Summary (Now requires button click again) ---
     st.subheader("🤖 AI-Powered Summary")
-    if st.session_state.get('summary'):
-         st.markdown(st.session_state.summary)
-    else:
-        # Show a placeholder or message if summary isn't ready or failed
-        if ai_enabled:
-             st.info("Summary is being generated or encountered an issue.")
-        else:
-             st.warning("AI Summary feature is disabled. No API Key found.")
+    st.markdown("Click the button below for a summary of the key changes identified in the documents.")
 
-# Display loading indicator if processing is ongoing
+    # Disable button if AI isn't enabled OR if text extraction failed
+    button_disabled = not ai_enabled or st.session_state.original_text is None or st.session_state.revised_text is None
+
+    if st.button("✨ Get Summary", use_container_width=True, disabled=button_disabled, key="generate_summary"):
+        with st.spinner("Analyzing changes with Gemini AI... This might take a moment."):
+            summary = get_ai_summary(st.session_state.original_text, st.session_state.revised_text)
+            st.session_state['summary'] = summary
+            st.rerun() # Rerun to display the summary immediately
+
+    # Display the summary if it exists in the session state
+    if st.session_state.get('summary'):
+         st.markdown("### Summary of Changes:")
+         st.markdown(st.session_state.summary)
+    # Explain why button might be disabled
+    elif button_disabled and ai_enabled:
+         st.warning("Cannot generate summary. Ensure both files were read successfully.")
+
+
+# Display loading indicator if processing is ongoing (outside the main results display block)
 elif st.session_state.get('processing_comparison', False):
      st.markdown('<div class="loader-container"><div class="loader"></div><p>Processing...</p></div>', unsafe_allow_html=True)
+
