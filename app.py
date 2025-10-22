@@ -78,64 +78,71 @@ except Exception as e:
 
 # --- Helper Functions ---
 
-# --- ROBUST NORMALIZATION FUNCTION ---
+# --- CHATGPT'S NORMALIZATION FUNCTION ---
 @st.cache_data
-def extract_and_normalize_text_robust(file_bytes, filename="file"):
-    """Extracts text and applies ROBUST normalization suggested by user feedback."""
+def normalize_pdf_text(file_bytes, filename="file"):
+    """
+    Extracts and normalizes text preserving line structure, joining broken words.
+    Based on user-provided ChatGPT suggestion.
+    """
     try:
+        # Extract raw text first
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = "\n".join(page.get_text("text", sort=True) for page in doc) # Join pages with newline
 
-        # 1. Normalize Unicode (NFKC handles ligatures, formatting variants)
+        if not text:
+             print(f"Warning: No raw text extracted from {filename}")
+             return f"ERROR: No text found in PDF {filename}"
+
+        # 1. Normalize weird Unicode (NFKC handles ligatures, etc.)
         text = unicodedata.normalize("NFKC", text)
 
-        # 2. Rejoin words broken by arbitrary newlines (e.g., Pub\nlishers -> Publishers)
-        #    Looks for lowercase letter, newline, lowercase letter
-        text = re.sub(r'([a-z])\n([a-z])', r'\1\2', text, flags=re.IGNORECASE)
+        # 2. Fix words broken by a newline (Pu\nblishers → Publishers)
+        #    Only join if both sides seem like word characters
+        text = re.sub(r'([a-zA-Z0-9])\n([a-zA-Z0-9])', r'\1\2', text)
 
-        # 3. Rejoin hyphenated words broken by newlines (e.g., state-\nof-the-art -> state-of-the-art)
-        text = re.sub(r'-\n', '', text)
+        # 3. Fix hyphenated words broken by newline (state-\n R\N? -> \N )
+        text = re.sub(r'-\n', '', text) # Remove newline immediately after hyphen
 
-        # 4. Convert to lowercase AFTER rejoining words
-        text = text.lower()
+        # 4. Replace multiple spaces/tabs with a single space (preserves newlines for now)
+        text = re.sub(r'[ \t]+', ' ', text)
 
-        # 5. Normalize all whitespace (newlines, tabs, multiple spaces) to a single space
-        text = re.sub(r'\s+', ' ', text)
+        # 5. Normalize line endings (essential before splitting)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
 
-        # 6. Optional: Remove specific problematic punctuation if needed, AFTER whitespace collapse
-        #    Example: remove bullet points or excessive symbols
-        # text = re.sub(r'[•*#:]', '', text) # Example removal
-        # text = re.sub(r'\s+', ' ', text) # Collapse spaces again if punctuation removed
+        # 6. Remove leading/trailing spaces on each line
+        lines = text.split('\n')
+        stripped_lines = [line.strip() for line in lines]
 
-        # 7. Strip leading/trailing spaces
+        # 7. Remove blank lines (lines that become empty after stripping)
+        non_blank_lines = [line for line in stripped_lines if line]
+        text = '\n'.join(non_blank_lines)
+
+        # 8. Final strip for the whole text block
         text = text.strip()
 
         if not text:
-             print(f"Warning: No text extracted/normalized from {filename}")
-             return f"ERROR: No text found in PDF {filename}"
+             print(f"Warning: Text became empty after normalization for {filename}")
+             # Return error if normalization made it empty, might indicate issue
+             return f"ERROR: Text became empty after normalization for {filename}"
         return text
+
     except Exception as e:
         print(f"Error normalizing {filename}: {e}")
         return f"ERROR: Could not read/normalize {filename}. Details: {e}"
 
 
 def generate_diff_html(text1_norm, text2_norm, filename1="Original", filename2="Revised"):
-    """Creates side-by-side HTML diff using the ROBUSTLY NORMALIZED text."""
-    # NOTE: This diff accurately shows content diffs but loses original PDF layout.
+    """Creates side-by-side HTML diff using the NORMALIZED text (preserving lines)."""
     if text1_norm is None or text2_norm is None or text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
          return "Error: Cannot generate visual diff (text normalization failed)."
     try:
-        # Split normalized text into lines/chunks for visual diff display
-        # Splitting by sentence might be better than fixed length
-        lines1 = re.split(r'(?<=[.?!])\s+', text1_norm) # Split after sentence end + space
-        lines2 = re.split(r'(?<=[.?!])\s+', text2_norm)
-        # Ensure lists are not empty if text was short
-        if not lines1 and text1_norm: lines1 = [text1_norm]
-        if not lines2 and text2_norm: lines2 = [text2_norm]
-
+        # Use the normalized text directly, split by its preserved newlines
+        lines1 = text1_norm.splitlines()
+        lines2 = text2_norm.splitlines()
 
         html = difflib.HtmlDiff(wrapcolumn=100, tabsize=4).make_table(
-            lines1, # Use sentence-split lines for diff table
+            lines1,
             lines2,
             fromdesc=filename1 + " (Normalized)",
             todesc=filename2 + " (Normalized)"
@@ -169,52 +176,48 @@ def get_ai_summary(text1_norm, text2_norm):
        (isinstance(text2_norm, str) and text2_norm.startswith("ERROR:")):
         return "AI Summary cannot be generated: text normalization failed."
 
-    # --- Use diff_match_patch on ROBUSTLY NORMALIZED text ---
+    # --- Use diff_match_patch on the CORRECTLY NORMALIZED text ---
     dmp = dmp_module.diff_match_patch()
-    # Set timeout to prevent indefinite hangs on very large/complex diffs
-    dmp.Diff_Timeout = 1.0 # Timeout in seconds (adjust if needed)
+    dmp.Diff_Timeout = 1.0 # Keep timeout
     try:
+        # Pass the normalized text (which still has structure) to DMP
         diffs = dmp.diff_main(text1_norm, text2_norm)
         dmp.diff_cleanupSemantic(diffs) # Improves readability
     except Exception as dmp_err:
          print(f"Error during diff_match_patch: {dmp_err}")
-         # Fallback to simple check if DMP fails
-         if text1_norm == text2_norm:
-              return "INFO: No textual differences found after robust normalization."
-         else:
-              return f"ERROR: Failed to compute differences using diff_match_patch: {dmp_err}. Cannot generate summary."
-
+         if text1_norm == text2_norm: return "INFO: No textual differences found after robust normalization."
+         else: return f"ERROR: Failed to compute differences using diff_match_patch: {dmp_err}."
 
     # --- Extract ONLY true additions and deletions for the AI ---
     meaningful_diff_fragments_for_ai = []
     for op, data in diffs:
-        data_strip = data.strip() # Strip whitespace from the fragment itself
-        if not data_strip: continue # Skip fragments that become empty after stripping
+        # Normalize whitespace within the fragment for cleaner AI input, then strip
+        data_clean = re.sub(r'\s+', ' ', data).strip()
+        if not data_clean: continue # Skip empty/whitespace fragments
 
         prefix = ""
         if op == dmp.DIFF_INSERT: prefix = "+"
         elif op == dmp.DIFF_DELETE: prefix = "-"
         else: continue # Skip equal parts
 
-        meaningful_diff_fragments_for_ai.append(f"{prefix}{data_strip}\n")
+        meaningful_diff_fragments_for_ai.append(f"{prefix}{data_clean}\n") # Add newline separator
 
 
     # --- Handle No Differences Case ---
     if not meaningful_diff_fragments_for_ai:
-         # Double check if texts were identical to avoid false negatives if DMP missed something minor
          if text1_norm == text2_norm:
             return "INFO: No textual differences were found between the documents after robust normalization."
          else:
-             # This suggests DMP might have timed out or failed silently on minor diffs
+             # If texts weren't identical but DMP found no diffs (e.g., timeout, edge case)
              return "INFO: No significant content changes detected by diff_match_patch after robust normalization. Minor variations might exist."
 
 
     diff_text_for_prompt = "".join(meaningful_diff_fragments_for_ai)
 
-    # --- AI Prompt (v16 - Using robustly normalized DMP diff fragments) ---
-    # Keeping the same prompt structure as it should receive clean input now
+    # --- AI Prompt (v17 - Using correctly normalized DMP diff fragments) ---
+    # Keep the same prompt asking for 3 categories
     prompt = f"""
-    Analyze the provided ADDED (+) and DELETED (-) content fragments. These fragments represent meaningful content changes between two clinical trial protocol versions after robust normalization (lowercase, rejoined words, collapsed whitespace, minimal punctuation). Categorize these fragments.
+    Analyze the provided ADDED (+) and DELETED (-) content fragments. These fragments represent meaningful content changes between two clinical trial protocol versions after robust normalization (lowercase, rejoined words, normalized whitespace). Categorize these fragments.
 
     **Instructions:**
     1.  **Clinically Significant Changes:** Identify ADDED (+) or DELETED (-) fragments clearly related to:
@@ -328,9 +331,9 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                 file1_bytes = file1.getvalue()
                 file2_bytes = file2.getvalue()
 
-                # --- Extract NORMALIZED text using the new function ---
-                text1_norm = extract_and_normalize_text_robust(file1_bytes, file1.name)
-                text2_norm = extract_and_normalize_text_robust(file2_bytes, file2.name)
+                # --- Extract NORMALIZED text using the CORRECT function ---
+                text1_norm = normalize_pdf_text(file1_bytes, file1.name)
+                text2_norm = normalize_pdf_text(file2_bytes, file2.name)
 
                 # Store normalized text
                 st.session_state['original_text_normalized'] = text1_norm
@@ -360,7 +363,7 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
 
     # --- Side-by-Side Diff (using normalized text) ---
     st.subheader("Visual Comparison (Based on Normalized Text)")
-    st.markdown("*(Note: Original formatting/line breaks ignored to focus on content)*")
+    st.markdown("*(Note: Original formatting may differ slightly due to normalization)*") # Updated note
     st.components.v1.html(st.session_state.diff_html, height=400, scrolling=True)
 
 
@@ -399,7 +402,7 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                 # Parsing logic remains the same
                 sections = {}
                 current_section_key = None
-                headers_map = {
+                headers_map = { # Ensure these match the AI prompt's H4 headers
                     "#### Clinically Significant Changes (Added/Deleted Content)": "significant",
                     "#### Other Added Content": "added",
                     "#### Other Deleted Content": "deleted"
@@ -441,10 +444,10 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                                 else:
                                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}")
                     else:
-                         st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*")
+                         st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*") # Display None found if section is missing or truly empty
             except Exception as e:
                 st.error(f"Failed to parse AI summary format. Raw output:\nError: {e}")
-                st.markdown(f"```markdown\n{summary_text}\n```")
+                st.markdown(f"```markdown\n{summary_text}\n```") # Fallback to raw
 
     # Explain disabled button state
     elif button_disabled and not st.session_state.get('processing_comparison'):
