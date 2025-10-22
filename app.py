@@ -118,17 +118,28 @@ def extract_text_from_bytes(file_bytes, filename="file"):
         text = "\n".join(page.get_text() for page in doc)
         
         # --- UPDATED CLEANING STEPS ---
-        # Fix common PDF ligature issues (like 'ﬁ' -> 'fi')
+        # Fix common PDF ligature issues (like 'fi' -> 'fl')
         text = re.sub(r'ﬁ', 'fi', text)
         text = re.sub(r'ﬂ', 'fl', text)
+        
+        # --- NEW: Convert all text to lowercase ---
+        text = text.lower()
+        
+        # --- NEW: Add space around punctuation to separate words ---
+        text = re.sub(r'([:.,;()])', r' \1 ', text)
         
         # Replace tabs and other non-newline whitespace with a single space
         text = re.sub(r'[ \t\r\f\v]+', ' ', text)
         
-        # Optional: Collapse multiple blank lines into one
+        # --- NEW: Strip leading/trailing whitespace from EACH line ---
+        lines = text.splitlines()
+        cleaned_lines = [line.strip() for line in lines]
+        text = "\n".join(cleaned_lines)
+        
+        # Collapse multiple blank lines into one
         text = re.sub(r'\n\s*\n', '\n', text)
         
-        # Remove leading/trailing whitespace
+        # Remove leading/trailing whitespace from the whole block
         text = text.strip()
         # --- END UPDATED CLEANING STEPS ---
         
@@ -279,3 +290,4 @@ if st.session_state.get('diff_html'):
 if st.session_state.get('summary'):
     st.markdown("### Summary of Changes:")
     st.markdown(st.session_state.summary)
+
