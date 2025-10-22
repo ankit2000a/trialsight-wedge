@@ -4,6 +4,7 @@ import difflib
 import google.generativeai as genai
 import os
 import time
+import re  # <-- ADDED THIS IMPORT
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -96,7 +97,7 @@ try:
     
     if api_key:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-pro') 
+        model = genai.GenerativeModel('gemini-2.5-pro') # Using the model you found
         ai_enabled = True
     else:
         st.warning("Google API Key not found. The AI Summary feature is disabled.")
@@ -108,15 +109,25 @@ except Exception as e:
 
 # --- Helper Functions ---
 
-# ***FIX 1:***
-# We cache the function that takes BYTES, not the file object.
-# This makes the cache reliable.
 @st.cache_data
 def extract_text_from_bytes(file_bytes, filename="file"):
-    """Extracts text from PDF bytes."""
+    """Extracts and CLEANS text from PDF bytes."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = " ".join(page.get_text() for page in doc)
+        
+        # --- NEW CLEANING STEPS ---
+        # Fix common PDF ligature issues (like 'ﬁ' -> 'fi')
+        text = re.sub(r'ﬁ', 'fi', text)
+        text = re.sub(r'ﬂ', 'fl', text)
+        
+        # Replace all whitespace (spaces, tabs, newlines) with a single space
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove leading/trailing whitespace
+        text = text.strip()
+        # --- END NEW CLEANING STEPS ---
+        
         return text
     except Exception as e:
         return f"Error reading {filename}: {e}"
@@ -150,7 +161,8 @@ def get_ai_summary(text1, text2):
     diff_text = "".join([line for line in diff if line.startswith(('+', '-')) and not line.startswith(('---', '+++'))])
 
     if not diff_text.strip():
-        return "No significant textual differences were found to summarize."
+        # --- UPDATED MESSAGE ---
+        return "No substantive textual differences were found after cleaning and normalization."
 
     prompt = f"""
     You are an expert clinical trial protocol reviewer. Analyze the following changes between two versions of a document and generate a concise, bulleted list of the most significant modifications.
@@ -214,16 +226,14 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
         st.session_state.diff_html = None
         st.session_state.summary = None
 
-        with st.spinner("Reading and comparing documents..."):
+        # --- UPDATED SPINNER TEXT ---
+        with st.spinner("Reading, cleaning, and comparing documents..."):
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
             
-            # ***FIX 2:***
-            # We read the bytes from the files first.
             file1_bytes = file1.getvalue()
             file2_bytes = file2.getvalue()
             
-            # Then we pass the BYTES to our cached function.
             text1 = extract_text_from_bytes(file1_bytes, file1.name)
             text2 = extract_text_from_bytes(file2_bytes, file2.name)
             
