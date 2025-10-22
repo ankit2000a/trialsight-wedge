@@ -5,7 +5,7 @@ import google.generativeai as genai
 import os
 import time
 import re
-# --- NEW LIBRARY ---
+import unicodedata # --- NEW LIBRARY ---
 import diff_match_patch as dmp_module
 
 # --- Page Configuration ---
@@ -27,9 +27,9 @@ st.markdown("""
     .diff_add { background-color: rgba(16, 185, 129, 0.15); color: #A7F3D0; }
     .diff_chg { background-color: rgba(209, 163, 23, 0.15); color: #FDE68A; }
     .diff_sub { background-color: rgba(239, 68, 68, 0.15); color: #FECACA; text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); }
-    table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; }
+    table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; table-layout: fixed; } /* Fixed layout */
     .diff_header { background-color: #374151; color: #E5E7EB; padding: 0.2em 0.5em; font-weight: bold; position: sticky; top: 0; z-index: 10;}
-    td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; }
+    td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; word-wrap: break-word; } /* Allow breaking long words */
     .diff_next { background-color: #4b5563; }
     /* Summary Styles */
     .summary-add { color: #6EE7B7; }
@@ -47,10 +47,9 @@ st.markdown("""
 
 # --- Session State Initialization ---
 def init_session_state():
-    # Add keys for different text versions
+    # Using only one text version now
     keys = ['file1_data', 'file2_data', 'diff_html', 'summary',
-            'original_text_display', 'revised_text_display', # For visual diff
-            'original_text_ai', 'revised_text_ai', # For AI comparison
+            'original_text_normalized', 'revised_text_normalized', # Renamed
             'processing_comparison']
     for key in keys:
         if key not in st.session_state:
@@ -72,14 +71,8 @@ try:
     if api_key:
         genai.configure(api_key=api_key)
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
-             # Check model availability - maybe fall back if 2.5-pro fails?
-             try:
-                 st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
-                 # Try a quick test call? Could hit quota.
-             except Exception as model_err:
-                 print(f"Warning: Failed to initialize gemini-2.5-pro: {model_err}. Falling back.")
-                 # Fallback model if needed (adjust based on availability)
-                 st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Example fallback
+             try: st.session_state.gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+             except Exception: st.session_state.gemini_model = genai.GenerativeModel('gemini-pro') # Fallback
         model = st.session_state.gemini_model
         ai_enabled = True
     else:
@@ -92,101 +85,105 @@ except Exception as e:
 
 # --- Helper Functions ---
 
-# --- Function 1: Minimal cleaning for VISUAL DIFF ---
+# --- NEW NORMALIZATION FUNCTION ---
 @st.cache_data
-def extract_text_for_display(file_bytes, filename="file"):
-    """Extracts text with minimal cleaning, preserving structure for visual diff."""
+def extract_and_normalize_text(file_bytes, filename="file"):
+    """Extracts text and applies robust normalization for comparison."""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "\n".join(page.get_text("text", sort=True) for page in doc)
-        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        text = re.sub(r'[ \t]+', ' ', text)
-        lines = text.splitlines()
-        cleaned_lines = [line.strip() for line in lines]
-        text = "\n".join(cleaned_lines)
-        text = re.sub(r'\n(\s*\n)+', '\n\n', text)
-        text = text.strip()
-        if not text: return f"ERROR: No text found in PDF {filename}"
-        return text
-    except Exception as e:
-        print(f"Error (display text) reading {filename}: {e}")
-        return f"ERROR: Could not read {filename}. Details: {e}"
+        text = " ".join(page.get_text("text", sort=True) for page in doc) # Join pages with space
 
-# --- Function 2: Hyper-aggressive cleaning for AI COMPARISON ---
-@st.cache_data
-def extract_text_for_ai(file_bytes, filename="file"):
-    """Extracts text and performs HYPER-AGGRESSIVE cleaning for AI comparison."""
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        text = " ".join(page.get_text("text", sort=True) for page in doc) # Join pages with space initially
+        # 1. Normalize Unicode (NFKC handles ligatures like fi/fl and other variants)
+        text = unicodedata.normalize("NFKC", text)
 
-        # --- Hyper-Aggressive Cleaning ---
-        text = text.replace('ﬁ', 'fi').replace('ﬂ', 'fl')
-        text = text.lower() # Lowercase
-        # Remove punctuation carefully - keep hyphens? Maybe remove all non-alphanumeric/space
-        # A simpler approach: replace common punctuation with space first
-        text = re.sub(r'[.,;:"“”‘’()\[\]/?!]', ' ', text)
-        # Collapse ALL whitespace (newlines, tabs, multiple spaces) to single spaces
+        # 2. Rejoin words broken by line breaks (optional: improve regex if needed)
+        #    This looks for a lowercase letter, a newline, then another lowercase letter
+        text = re.sub(r'([a-z])\n([a-z])', r'\1\2', text, flags=re.IGNORECASE)
+        #    Maybe also handle hyphenated words broken across lines?
+        text = re.sub(r'-\n', '', text) # Remove newline after hyphen
+
+        # 3. Convert to lowercase BEFORE collapsing whitespace
+        text = text.lower()
+
+        # 4. Replace various whitespace chars (newline, tab, etc.) with a single space
         text = re.sub(r'\s+', ' ', text)
+
+        # 5. Remove potentially problematic punctuation (keep basic sentence structure if possible)
+        # text = re.sub(r'[.,;:"“”‘’()\[\]/?!]', ' ', text) # Replace with space
+        # text = re.sub(r'\s+', ' ', text) # Collapse spaces again
+
+        # 6. Strip leading/trailing spaces
         text = text.strip()
 
         if not text:
-             # Reuse error message from display function if needed
-             print(f"Warning: No text extracted (for AI) from {filename}")
+             print(f"Warning: No text extracted/normalized from {filename}")
              return f"ERROR: No text found in PDF {filename}"
         return text
     except Exception as e:
-        print(f"Error (AI text) reading {filename}: {e}")
-        # Reuse error message
-        return f"ERROR: Could not read {filename}. Details: {e}"
+        print(f"Error normalizing {filename}: {e}")
+        return f"ERROR: Could not read/normalize {filename}. Details: {e}"
 
 
-def generate_diff_html(text1_display, text2_display, filename1="Original", filename2="Revised"):
-    """Creates side-by-side HTML diff using the DISPLAY text version."""
-    if text1_display is None or text2_display is None or text1_display.startswith("ERROR:") or text2_display.startswith("ERROR:"):
-         return "Error: Cannot generate visual diff (text extraction failed)."
+def generate_diff_html(text1_norm, text2_norm, filename1="Original", filename2="Revised"):
+    """Creates side-by-side HTML diff using the NORMALIZED text."""
+    # NOTE: This diff will NOT preserve original line breaks/formatting
+    if text1_norm is None or text2_norm is None or text1_norm.startswith("ERROR:") or text2_norm.startswith("ERROR:"):
+         return "Error: Cannot generate visual diff (text normalization failed)."
     try:
-        # Use display text (with line breaks)
-        html = difflib.HtmlDiff(wrapcolumn=80, tabsize=4).make_table(
-            text1_display.splitlines(),
-            text2_display.splitlines(),
-            fromdesc=filename1,
-            todesc=filename2
+        # Generate diff using the potentially long, normalized single-line strings
+        # We might need to split them artificially for HtmlDiff to work reasonably well visually
+        # Let's try splitting by sentences or fixed length chunks for display diff
+        # Simple split by sentence (period followed by space)
+        lines1 = re.split(r'(?<=\.)\s', text1_norm)
+        lines2 = re.split(r'(?<=\.)\s', text2_norm)
+
+        # Or split by roughly N characters/words for very long lines
+        # MAX_LEN = 100
+        # lines1 = [text1_norm[i:i+MAX_LEN] for i in range(0, len(text1_norm), MAX_LEN)]
+        # lines2 = [text2_norm[i:i+MAX_LEN] for i in range(0, len(text2_norm), MAX_LEN)]
+
+
+        html = difflib.HtmlDiff(wrapcolumn=100, tabsize=4).make_table( # Increased wrap column
+            lines1, # Use artificially split lines for visual diff
+            lines2,
+            fromdesc=filename1 + " (Normalized)", # Indicate text is normalized
+            todesc=filename2 + " (Normalized)"
         )
         style = f"<style>{difflib.HtmlDiff._styles}</style>"
         custom_style = """
         <style>
-        table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; }
+        table.diff { font-family: Consolas, 'Courier New', monospace; border-collapse: collapse; width: 100%; font-size: 0.875em; table-layout: fixed; }
         .diff_header { background-color: #374151; color: #E5E7EB; padding: 0.2em 0.5em; font-weight: bold; position: sticky; top: 0; z-index: 10;}
-        td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; }
+        td { padding: 0.1em 0.4em; vertical-align: top; white-space: pre-wrap; word-wrap: break-word; } /* Force wrap */
         .diff_next { background-color: #4b5563; }
-        .diff_add { background-color: rgba(16, 185, 129, 0.08); }
-        .diff_chg { background-color: rgba(209, 163, 23, 0.08); }
-        .diff_sub { background-color: rgba(239, 68, 68, 0.08); text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); }
+        .diff_add { background-color: rgba(16, 185, 129, 0.1); }
+        .diff_chg { background-color: rgba(209, 163, 23, 0.1); }
+        .diff_sub { background-color: rgba(239, 68, 68, 0.1); text-decoration: none; border-bottom: 1px dotted rgba(239, 68, 68, 0.5); }
         </style>
         """
-        return style + custom_style + html
+        # Ensure the container allows scrolling if content overflows
+        return f"<div style='overflow-x: auto;'>{style + custom_style + html}</div>"
     except Exception as e:
         print(f"Error generating HTML diff: {e}")
+        # Check specifically for recursion error
         if isinstance(e, RecursionError):
-            return "Error: Failed to generate visual comparison due to text complexity."
+            return "Error: Failed to generate visual comparison due to excessive text complexity after normalization."
         return f"Error: Failed to generate visual comparison. {e}"
 
 
-def get_ai_summary(text1_ai, text2_ai):
-    """Generates a categorized summary using AI based on hyper-cleaned diff_match_patch comparison."""
+def get_ai_summary(text1_norm, text2_norm):
+    """Generates a categorized summary using AI based on normalized diff_match_patch comparison."""
     # --- Input Validation ---
     if not ai_enabled: return "AI Summary feature is not available (API key issue)."
-    # Check the AI-specific text versions
-    if text1_ai is None or text2_ai is None or \
-       (isinstance(text1_ai, str) and text1_ai.startswith("ERROR:")) or \
-       (isinstance(text2_ai, str) and text2_ai.startswith("ERROR:")):
-        return "AI Summary cannot be generated: hyper-cleaned text extraction failed."
+    # Check the normalized text versions
+    if text1_norm is None or text2_norm is None or \
+       (isinstance(text1_norm, str) and text1_norm.startswith("ERROR:")) or \
+       (isinstance(text2_norm, str) and text2_norm.startswith("ERROR:")):
+        return "AI Summary cannot be generated: text normalization failed."
 
-    # --- Use diff_match_patch on HYPER-CLEANED text ---
+    # --- Use diff_match_patch on ROBUSTLY NORMALIZED text ---
     dmp = dmp_module.diff_match_patch()
-    diffs = dmp.diff_main(text1_ai, text2_ai) # These are single strings now
+    diffs = dmp.diff_main(text1_norm, text2_norm) # These are single strings, robustly cleaned
     dmp.diff_cleanupSemantic(diffs)
 
     # --- Extract ONLY true additions and deletions for the AI ---
@@ -205,17 +202,17 @@ def get_ai_summary(text1_ai, text2_ai):
 
     # --- Handle No Differences Case ---
     if not meaningful_diff_fragments_for_ai:
-        # Check if original texts were actually different before hyper-cleaning
-        # Need to re-read or use display text for a meaningful check here
-        # Let's assume if DMP found nothing on hyper-clean, there's no content change
-         return "INFO: No substantive content changes detected after aggressive cleaning (ignoring formatting, case, punctuation, and whitespace)."
-
+         # Check if original normalized texts were actually different
+         if text1_norm != text2_norm: # Should not happen if DMP found nothing, but safety check
+            return "INFO: No significant content changes detected by diff_match_patch after robust normalization."
+         else:
+            return "INFO: No textual differences were found between the documents after robust normalization."
 
     diff_text_for_prompt = "".join(meaningful_diff_fragments_for_ai)
 
-    # --- AI Prompt (v14 - Using hyper-clean DMP diff fragments) ---
+    # --- AI Prompt (v15 - Using robustly normalized DMP diff fragments) ---
     prompt = f"""
-    Analyze the provided ADDED (+) and DELETED (-) content fragments. These fragments represent meaningful content changes between two clinical trial protocol versions after aggressive cleaning (lowercase, punctuation/whitespace removed). Categorize these fragments.
+    Analyze the provided ADDED (+) and DELETED (-) content fragments. These fragments represent meaningful content changes between two clinical trial protocol versions after robust normalization (lowercase, rejoined words, collapsed whitespace). Categorize these fragments.
 
     **Instructions:**
     1.  **Clinically Significant Changes:** Identify ADDED (+) or DELETED (-) fragments clearly related to:
@@ -224,7 +221,7 @@ def get_ai_summary(text1_ai, text2_ai):
         * Procedures / Assessments
         * Safety reporting
         * Objectives / Endpoints
-        List these first. Due to cleaning, precise location is lost, but indicate the nature of the change.
+        List these first. Indicate the nature of the change (added/deleted content).
     2.  **Other Added Content:** List ALL OTHER provided ADDED (+) fragments.
     3.  **Other Deleted Content:** List ALL OTHER provided DELETED (-) fragments.
     4.  **Output Format:** Structure your response EXACTLY like this, using markdown H4 (####) for headers:
@@ -238,7 +235,7 @@ def get_ai_summary(text1_ai, text2_ai):
         #### Other Deleted Content
         * [List ALL OTHER non-blank DELETED (-) content from the input here. If none found, state "None found."]
 
-    **Meaningful Added (+) and Deleted (-) Content Fragments (Hyper-Cleaned):**
+    **Meaningful Added (+) and Deleted (-) Content Fragments (Robustly Normalized):**
     ---
     {diff_text_for_prompt[:8000]}
     ---
@@ -247,7 +244,6 @@ def get_ai_summary(text1_ai, text2_ai):
     """
 
     try:
-        # Safety settings and generation config remain the same
         safety_settings = [ {"category": c, "threshold": "BLOCK_LOW_AND_ABOVE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         generation_config = genai.types.GenerationConfig(temperature=0.1)
         if 'gemini_model' not in st.session_state or st.session_state.gemini_model is None:
@@ -266,10 +262,8 @@ def get_ai_summary(text1_ai, text2_ai):
              response_text = candidate.content.parts[0].text.strip()
              return response_text
         else:
-             # Add safety ratings if available and finish reason suggests safety block
              safety_ratings_str = "N/A"
-             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'):
-                  safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
+             if finish_reason == 'SAFETY' and hasattr(candidate, 'safety_ratings'): safety_ratings_str = ", ".join([f"{r.category.name}: {r.probability.name}" for r in candidate.safety_ratings])
              return f"ERROR: AI model returned an empty response. Finish Reason: {finish_reason}. Safety Ratings: [{safety_ratings_str}]"
     except Exception as e:
         error_message = f"ERROR: Failed to get AI summary: {e}"
@@ -291,7 +285,7 @@ if not st.session_state.get('file1_data') and not st.session_state.get('file2_da
             st.session_state.file1_data = uploaded_files[0]
             st.session_state.file2_data = uploaded_files[1]
             # Clear all results on new upload
-            keys_to_clear = ['diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai']
+            keys_to_clear = ['diff_html', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
             for key in keys_to_clear:
                 if key in st.session_state: del st.session_state[key]
             st.session_state.processing_comparison = False
@@ -303,7 +297,7 @@ else:
     with col1: st.success(f"Original: **{file1_name}**")
     with col2: st.success(f"Revised: **{file2_name}**")
     if st.button("Clear Files and Start Over"):
-        keys_to_clear = ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai', 'processing_comparison']
+        keys_to_clear = ['file1_data', 'file2_data', 'diff_html', 'summary', 'original_text_normalized', 'revised_text_normalized', 'processing_comparison']
         for key in keys_to_clear:
             if key in st.session_state: del st.session_state[key]
         st.rerun()
@@ -315,14 +309,14 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
         if st.button("Compare Documents", type="primary", use_container_width=True):
             st.session_state.processing_comparison = True
             # Clear previous results
-            keys_to_clear = ['diff_html', 'summary', 'original_text_display', 'revised_text_display', 'original_text_ai', 'revised_text_ai']
+            keys_to_clear = ['diff_html', 'summary', 'original_text_normalized', 'revised_text_normalized']
             for key in keys_to_clear:
                  if key in st.session_state: del st.session_state[key]
             st.rerun()
 
     # Execute comparison if flagged
     if st.session_state.get('processing_comparison'):
-        with st.spinner("Reading, cleaning, and comparing documents..."):
+        with st.spinner("Reading, normalizing, and comparing documents..."): # Updated text
             time.sleep(0.5) # Ensure spinner shows
             file1 = st.session_state.file1_data
             file2 = st.session_state.file2_data
@@ -330,20 +324,16 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
                 file1_bytes = file1.getvalue()
                 file2_bytes = file2.getvalue()
 
-                # --- Extract BOTH versions ---
-                text1_display = extract_text_for_display(file1_bytes, file1.name)
-                text2_display = extract_text_for_display(file2_bytes, file2.name)
-                text1_ai = extract_text_for_ai(file1_bytes, file1.name)
-                text2_ai = extract_text_for_ai(file2_bytes, file2.name)
+                # --- Extract NORMALIZED text ---
+                text1_norm = extract_and_normalize_text(file1_bytes, file1.name)
+                text2_norm = extract_and_normalize_text(file2_bytes, file2.name)
 
-                # Store both versions
-                st.session_state['original_text_display'] = text1_display
-                st.session_state['revised_text_display'] = text2_display
-                st.session_state['original_text_ai'] = text1_ai
-                st.session_state['revised_text_ai'] = text2_ai
+                # Store normalized text
+                st.session_state['original_text_normalized'] = text1_norm
+                st.session_state['revised_text_normalized'] = text2_norm
 
-                # Generate HTML diff using display version
-                st.session_state['diff_html'] = generate_diff_html(text1_display, text2_display, file1.name, file2.name) # Handles internal errors
+                # Generate HTML diff using normalized text (handles internal errors)
+                st.session_state['diff_html'] = generate_diff_html(text1_norm, text2_norm, file1.name, file2.name)
             else:
                 st.session_state['diff_html'] = "Error: File data missing."
                 st.session_state['summary'] = None
@@ -356,52 +346,43 @@ if st.session_state.get('file1_data') and st.session_state.get('file2_data'):
 # --- Display Results Section ---
 if not st.session_state.get('processing_comparison') and st.session_state.get('diff_html') and isinstance(st.session_state.get('diff_html'), str) and not st.session_state.get('diff_html', "").startswith("Error:"):
 
-    # --- DEBUGGER (Shows BOTH cleaned versions) ---
-    with st.expander("Show/Hide Cleaned Text Versions"):
+    # --- DEBUGGER (Shows the normalized text) ---
+    with st.expander("Show/Hide Normalized Text (Used for Comparison)"):
         col1, col2 = st.columns(2)
-        # Display text, handle None or Error strings gracefully
-        original_display_txt = st.session_state.get('original_text_display') if isinstance(st.session_state.get('original_text_display'), str) else "Extraction Error or Not Run"
-        revised_display_txt = st.session_state.get('revised_text_display') if isinstance(st.session_state.get('revised_text_display'), str) else "Extraction Error or Not Run"
-        original_ai_txt = st.session_state.get('original_text_ai') if isinstance(st.session_state.get('original_text_ai'), str) else "Extraction Error or Not Run"
-        revised_ai_txt = st.session_state.get('revised_text_ai') if isinstance(st.session_state.get('revised_text_ai'), str) else "Extraction Error or Not Run"
+        original_display = st.session_state.get('original_text_normalized') if isinstance(st.session_state.get('original_text_normalized'), str) else "Normalization Error or Not Run"
+        revised_display = st.session_state.get('revised_text_normalized') if isinstance(st.session_state.get('revised_text_normalized'), str) else "Normalization Error or Not Run"
+        # Use markdown code block for potentially long single lines
+        with col1: st.subheader("Original (Normalized)"); st.code(original_display, language=None)
+        with col2: st.subheader("Revised (Normalized)"); st.code(revised_display, language=None)
 
-        with col1:
-            st.subheader("Original (For Visual Diff)")
-            st.text_area("Original Display", original_display_txt, height=150, key="dbg_txt1_disp")
-            st.subheader("Original (For AI Compare)")
-            st.text_area("Original AI", original_ai_txt, height=150, key="dbg_txt1_ai")
-        with col2:
-            st.subheader("Revised (For Visual Diff)")
-            st.text_area("Revised Display", revised_display_txt, height=150, key="dbg_txt2_disp")
-            st.subheader("Revised (For AI Compare)")
-            st.text_area("Revised AI", revised_ai_txt, height=150, key="dbg_txt2_ai")
+    # --- Side-by-Side Diff (using normalized text) ---
+    st.subheader("Visual Comparison (Based on Normalized Text)")
+    st.markdown("*(Note: Original formatting/line breaks ignored to focus on content)*")
+    # Wrap the HTML component in a div that allows scrolling
+    st.components.v1.html(st.session_state.diff_html, height=400, scrolling=True)
 
-
-    # --- Side-by-Side Diff (uses display text) ---
-    with st.expander("Show/Hide Side-by-Side Diff", expanded=True):
-        st.components.v1.html(st.session_state.diff_html, height=600, scrolling=True)
 
     st.markdown("---")
 
     # --- AI Summary ---
     st.subheader("🤖 AI-Powered Summary of Content Changes")
-    st.markdown("Click for summary using hyper-cleaned text comparison.") # Updated text
-    # Disable button checks based on AI text versions
-    button_disabled = not ai_enabled or (isinstance(st.session_state.get('original_text_ai'), str) and st.session_state.get('original_text_ai', "").startswith("ERROR:")) \
-                      or (isinstance(st.session_state.get('revised_text_ai'), str) and st.session_state.get('revised_text_ai', "").startswith("ERROR:")) \
-                      or st.session_state.get('original_text_ai') is None or st.session_state.get('revised_text_ai') is None
+    st.markdown("Click for summary based on normalized text comparison.")
+    # Disable button checks based on normalized text versions
+    button_disabled = not ai_enabled or (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")) \
+                      or (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")) \
+                      or st.session_state.get('original_text_normalized') is None or st.session_state.get('revised_text_normalized') is None
 
-    summary_button_label = "✨ Get Content Changes Summary" # Updated label
+    summary_button_label = "✨ Get Content Changes Summary"
     if st.session_state.get('summary') is not None: summary_button_label = "🔄 Regenerate Summary"
 
     if st.button(summary_button_label, use_container_width=True, disabled=button_disabled, key="gen_summary_btn"):
-        # Use the HYPER-CLEANED texts stored in state
-        if st.session_state.get('original_text_ai') is not None and st.session_state.get('revised_text_ai') is not None:
+        # Use the NORMALIZED texts stored in state
+        if st.session_state.get('original_text_normalized') is not None and st.session_state.get('revised_text_normalized') is not None:
             with st.spinner("Analyzing content changes..."):
-                summary_result = get_ai_summary(st.session_state.original_text_ai, st.session_state.revised_text_ai)
+                summary_result = get_ai_summary(st.session_state.original_text_normalized, st.session_state.revised_text_normalized)
                 st.session_state['summary'] = summary_result
                 st.rerun()
-        else: st.error("Cannot generate summary: Hyper-cleaned text missing.")
+        else: st.error("Cannot generate summary: Normalized text missing.")
 
     # --- Display Summary (Using Formatted Display Logic - unchanged) ---
     if st.session_state.get('summary') is not None:
@@ -437,9 +418,11 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                              break
                     if matched_header: continue
                     if current_section_key and line_strip.startswith('* '):
-                         sections[current_section_key].append(line_strip[2:].strip())
+                         # Store the raw item text including +/- if present
+                         item_text = line_strip[2:].strip()
+                         sections[current_section_key].append(item_text)
                     elif current_section_key and line_strip and "none found" in line_strip.lower():
-                         sections[current_section_key].append(line_strip)
+                         sections[current_section_key].append(line_strip) # Keep 'None found' as is
 
                 st.markdown("### Categorized Summary of Content Changes:") # Updated title
                 for key, display_name in header_display.items():
@@ -450,12 +433,13 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
                             st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{items[0]}*")
                         else:
                             for item in items:
+                                # Apply styling based on +/- prefix within the item text
                                 if item.startswith('+'):
                                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-add'>{item}</span>", unsafe_allow_html=True)
                                 elif item.startswith('-'):
                                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;<span class='summary-del'>{item}</span>", unsafe_allow_html=True)
                                 else:
-                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}")
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{item}") # Fallback
                     else:
                          st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*None found.*")
             except Exception as e:
@@ -465,11 +449,11 @@ if not st.session_state.get('processing_comparison') and st.session_state.get('d
     # Explain disabled button state
     elif button_disabled and not st.session_state.get('processing_comparison'):
          if not ai_enabled: st.warning("AI Summary disabled: API Key missing/invalid.")
-         # Check AI text versions for failure
-         elif (isinstance(st.session_state.get('original_text_ai'), str) and st.session_state.get('original_text_ai', "").startswith("ERROR:")) or \
-              (isinstance(st.session_state.get('revised_text_ai'), str) and st.session_state.get('revised_text_ai', "").startswith("ERROR:")):
-             st.warning("AI Summary disabled: Text extraction failed (AI version).")
-         elif st.session_state.get('original_text_ai') is None or st.session_state.get('revised_text_ai') is None:
+         # Check normalized text versions for failure
+         elif (isinstance(st.session_state.get('original_text_normalized'), str) and st.session_state.get('original_text_normalized', "").startswith("ERROR:")) or \
+              (isinstance(st.session_state.get('revised_text_normalized'), str) and st.session_state.get('revised_text_normalized', "").startswith("ERROR:")):
+             st.warning("AI Summary disabled: Text normalization failed.")
+         elif st.session_state.get('original_text_normalized') is None or st.session_state.get('revised_text_normalized') is None:
              st.warning("AI Summary disabled: Click 'Compare Documents' first.")
 
 # Handle Errors / Loading State
